@@ -39,6 +39,10 @@ if(existsSync(NODE_MODULES_PATH)) {
 }
 
 const isDEV = process.env.NODE_ENV === 'development';
+// Lean by default: the dev-only extras (type/lint checker, file watcher, hot-update machinery, lang/SCSS-type
+// generators, settings-search regeneration) are off. They matter when editing tweb itself, not when running it
+// as a front end for the simulated backend. TWEB_FULL=1 pnpm start brings all of them back.
+const FULL = process.env.TWEB_FULL === '1';
 const generateDevCssModuleScopedName = (name: string, filename: string) => {
   const relativePath = path.relative(rootDir, filename).split(path.sep).join('/');
   const fileHash = createHash('sha1').update(relativePath).digest('hex').slice(0, 10);
@@ -57,7 +61,7 @@ if(isDEV) {
   // A Playwright suite's server (TWEB_E2E) only serves the tree: the lang watcher would hash the
   // strings on every start and, after a lang.ts edit, run format-lang and rewrite files under the
   // run, and nobody edits SCSS through it.
-  if(!process.env.TWEB_E2E) {
+  if(FULL && !process.env.TWEB_E2E) {
     watchLangFile();
     // the dev server is what runs while the SCSS is being edited, so it is what keeps the generated
     // `*.module.d.scss.ts` in step — otherwise the editor (and `typecheck:watch`) reports a class
@@ -114,7 +118,8 @@ const serverOptions: ServerOptions = {
       '**/tmp/*', '**/tmp/!(vite-preview-cache|vite-e2e-cache)/**'
     ]
   },
-  watch: {
+  // lean mode: no file watcher at all (saves memory/CPU); edits need a restart. `null` is Vite's "off".
+  watch: !FULL ? null : {
     // NB: anchor on rootDir. A worktree checkout's own path contains
     // ".claude/worktrees/<name>/", so a bare '**/.claude/**' glob would also match
     // the worktree's OWN src and silently disable all HMR there. Anchoring ignores
@@ -259,10 +264,10 @@ export default defineConfig({
     //   /* features options - all disabled by default */
     //   autoname: true // e.g. enable autoname
     // }),
-    process.env.VITEST || process.env.TWEB_PREVIEW ? undefined : devChecks(rootDir),
-    process.env.VITEST ? undefined : settingsSearchPlugin(),
+    !FULL || process.env.VITEST || process.env.TWEB_PREVIEW ? undefined : devChecks(rootDir),
+    !FULL || process.env.VITEST ? undefined : settingsSearchPlugin(),
     watchTransformCache(),
-    hotReloadPlugin(),
+    FULL ? hotReloadPlugin() : undefined,
     solidPlugin(),
     handlebarsPlugin as any,
     compileHintsPlugin(),
