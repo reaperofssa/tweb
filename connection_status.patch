@@ -1,0 +1,52 @@
+diff --git a/src/lib/appManagers/apiManager.ts b/src/lib/appManagers/apiManager.ts
+index 7c3fac4..da5f952 100644
+--- a/src/lib/appManagers/apiManager.ts
++++ b/src/lib/appManagers/apiManager.ts
+@@ -704,12 +704,31 @@ export class ApiManager extends ApiManagerMethods {
+   private fakeSocket: WebSocket;
+   private fakeSocketAttempt = 0;
+ 
++  // * there is no networker in fake mode, so nobody would ever report the connection as up
++  // * ("Waiting for network..." forever). Report it ourselves, under the name the UI looks for
++  private fakeStatus: number;
++  private setFakeStatus(status: number) {
++    if(this.fakeStatus === status) return;
++    this.fakeStatus = status;
++    const dcId = 2;
++    this.rootScope.dispatchEvent('connection_status_change', {
++      _: 'networkerStatus',
++      status,
++      dcId,
++      name: 'NET-' + dcId,
++      isFileNetworker: false,
++      isFileDownload: false,
++      isFileUpload: false
++    });
++  }
++
+   private connectFakeUpdates() {
+     if(this.fakeSocket || !FAKE_API_URL) return;
+     const url = FAKE_API_URL.replace(/^http/, 'ws') + '/updates';
+     const socket = this.fakeSocket = new WebSocket(url);
+     socket.onopen = () => {
+       this.fakeSocketAttempt = 0;
++      this.setFakeStatus(0); // ConnectionStatus.Connected
+     };
+     socket.onmessage = (event) => {
+       try {
+@@ -721,6 +740,7 @@ export class ApiManager extends ApiManagerMethods {
+     };
+     socket.onclose = () => {
+       this.fakeSocket = undefined;
++      this.setFakeStatus(2); // ConnectionStatus.Closed
+       setTimeout(() => this.connectFakeUpdates(), Math.min(10000, 500 * ++this.fakeSocketAttempt));
+     };
+   }
+@@ -734,6 +754,7 @@ export class ApiManager extends ApiManagerMethods {
+       body: JSON.stringify({method, params, account: this.getAccountNumber()}, FAKE_JSON.replacer)
+     }).then((response) => response.text()).then((text) => {
+       const json = JSON.parse(text, FAKE_JSON.reviver);
++      this.setFakeStatus(0);
+       if(json.error) {
+         const error = makeError(json.error.type, json.error.message);
+         error.code = json.error.code || 400;
