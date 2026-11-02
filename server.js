@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+
 'use strict';
 /**
  * Simulated Telegram backend for tweb (Telegram Web K).
@@ -266,6 +266,137 @@ function simulateReply(key, text) {
   setTimeout(() => pushIncoming(key, uid, 'Echo: ' + text), 1800);
 }
 
+/* ───────────────────────────── previously-unhandled methods ───────────────────────────── */
+const NS = () => ({_: 'peerNotifySettings', pFlags: {}});
+const noMsgs = () => ({_: 'messages.messages', messages: [], topics: [], chats: [], users: []});
+const noStories = () => ({_: 'stories.stories', pFlags: {}, count: 0, stories: [], chats: [], users: []});
+const privacyAll = () => ({_: 'account.privacyRules', rules: [{_: 'privacyValueAllowAll'}], chats: [], users: []});
+const peerFromInput = (p) => { const k = peerKeyOf(p); return k ? peerOf(k) : {_: 'peerUser', user_id: SELF}; };
+
+// -- login screen / langpack
+H['help.getCountriesList'] = () => ({_: 'help.countriesList', hash: 1, countries: [
+  ['US', 'United States', '1'], ['GB', 'United Kingdom', '44'], ['NG', 'Nigeria', '234'], ['IN', 'India', '91'], ['BR', 'Brazil', '55'],
+  ['DE', 'Germany', '49'], ['FR', 'France', '33'], ['ZA', 'South Africa', '27'], ['KE', 'Kenya', '254'], ['GH', 'Ghana', '233']
+].map(([iso2, name, cc]) => ({_: 'help.country', pFlags: {}, iso2, default_name: name, name,
+  country_codes: [{_: 'help.countryCode', pFlags: {}, country_code: cc, prefixes: [], patterns: []}]}))});
+H['langpack.getLanguage'] = (p) => ({_: 'langPackLanguage', pFlags: {}, name: 'English', native_name: 'English', lang_code: p.lang_code || 'en',
+  plural_code: 'en', strings_count: 0, translated_count: 0, translations_url: ''});
+H['langpack.getStrings'] = () => [];
+H['auth.initPasskeyLogin'] = () => { throw fail(400, 'PASSKEY_LOGIN_UNAVAILABLE'); };
+H['help.getTimezonesList'] = () => ({_: 'help.timezonesList', hash: 1, timezones: [{_: 'timezone', id: 'UTC', name: 'UTC', utc_offset: 0}]});
+H['help.getPeerColors'] = H['help.getPeerProfileColors'] = () => ({_: 'help.peerColors', hash: 1, colors: []});
+H['help.getPromoData'] = () => ({_: 'help.promoDataEmpty', expires: now() + 86400});
+H['help.getPremiumPromo'] = () => ({_: 'help.premiumPromo', status_text: '', status_entities: [], video_sections: [], videos: [], period_options: [], users: []});
+
+// -- account
+H['account.getContentSettings'] = () => ({_: 'account.contentSettings', pFlags: {}});
+H['account.getGlobalPrivacySettings'] = () => ({_: 'globalPrivacySettings', pFlags: {}});
+H['account.getAuthorizations'] = () => ({_: 'account.authorizations', authorization_ttl_days: 365, authorizations: [{_: 'authorization',
+  pFlags: {current: true, official_app: true}, hash: '0', device_model: 'Web', platform: 'Web', system_version: '1', api_id: 1,
+  app_name: 'Telegram Web', app_version: '1.0', date_created: now() - 3600, date_active: now(), ip: '127.0.0.1', country: '', region: ''}]});
+H['account.getWebAuthorizations'] = () => ({_: 'account.webAuthorizations', authorizations: [], users: []});
+H['account.getConnectedBots'] = () => ({_: 'account.connectedBots', connected_bots: [], users: []});
+H['account.getNotifySettings'] = NS;
+H['account.getNotifyExceptions'] = () => updatesOf([]);
+H['account.getContactSignUpNotification'] = () => false;
+H['account.getReactionsNotifySettings'] = () => ({_: 'reactionsNotifySettings', pFlags: {}, sound: {_: 'notificationSoundDefault'}, show_previews: true});
+H['account.getPrivacy'] = privacyAll;
+H['account.getSavedMusicIds'] = () => ({_: 'account.savedMusicIds', ids: []});
+H['account.getPasskeys'] = () => ({_: 'account.passkeys', passkeys: []});
+H['account.getPassword'] = () => ({_: 'account.password', pFlags: {}, new_algo: {_: 'passwordKdfAlgoUnknown'},
+  new_secure_algo: {_: 'securePasswordKdfAlgoUnknown'}, secure_random: new Uint8Array(32)});
+H['account.getAccountTTL'] = () => ({_: 'accountDaysTTL', days: 365});
+H['account.getWallPapers'] = () => ({_: 'account.wallPapers', hash: 0, wallpapers: []});
+H['account.getThemes'] = () => ({_: 'account.themes', hash: 0, themes: []});
+H['account.updateStatus'] = () => true;
+H['account.checkUsername'] = (p) => ![...users].some(([i, u]) => i !== SELF && u.username === p.username);
+H['account.updateUsername'] = (p) => { users.get(SELF).username = p.username || undefined; return tlUser(SELF); };
+H['account.updateProfile'] = (p) => {
+  const u = users.get(SELF);
+  if(p.first_name !== undefined) u.first_name = p.first_name;
+  if(p.last_name !== undefined) u.last_name = p.last_name;
+  return tlUser(SELF);
+};
+
+// -- contacts
+H['contacts.getBirthdays'] = () => ({_: 'contacts.contactBirthdays', contacts: [], users: []});
+H['contacts.getBlocked'] = () => ({_: 'contacts.blocked', blocked: [], chats: [], users: []});
+H['contacts.getSponsoredPeers'] = () => ({_: 'contacts.sponsoredPeersEmpty'});
+
+// -- stickers / gifs / reactions / bots
+H['messages.getAttachMenuBots'] = () => ({_: 'attachMenuBots', hash: 0, bots: [], users: []});
+H['messages.getSavedReactionTags'] = () => ({_: 'messages.savedReactionTags', tags: [], hash: 0});
+H['messages.getSavedGifs'] = () => ({_: 'messages.savedGifs', hash: 0, gifs: []});
+H['messages.getFavedStickers'] = () => ({_: 'messages.favedStickers', hash: 0, packs: [], stickers: []});
+H['messages.getStickerSet'] = () => { throw fail(400, 'STICKERSET_INVALID'); };
+H['messages.getStickers'] = H['messages.getEmojiStickers'] = (p) => (p.emoticon !== undefined ?
+  {_: 'messages.stickers', hash: 0, stickers: []} : {_: 'messages.allStickers', hash: 0, sets: []});
+H['messages.getAvailableReactions'] = () => ({_: 'messages.availableReactions', hash: 0, reactions: []});
+H['messages.getTopReactions'] = () => ({_: 'messages.reactions', hash: 0, reactions: []});
+H['messages.getEmojiKeywordsDifference'] = (p) => ({_: 'emojiKeywordsDifference', lang_code: p.lang_code || 'en', from_version: 0, version: 0, keywords: []});
+H['messages.getPaidReactionPrivacy'] = () => updatesOf([]);
+
+// -- messages misc
+H['messages.receivedMessages'] = () => [];
+H['messages.getPeerSettings'] = () => ({_: 'messages.peerSettings', settings: {_: 'peerSettings', pFlags: {}}, chats: [], users: []});
+H['messages.getScheduledHistory'] = noMsgs;
+H['messages.getSavedHistory'] = noMsgs;
+H['messages.getSavedDialogs'] = () => ({_: 'messages.savedDialogs', dialogs: [], messages: [], chats: [], users: []});
+H['messages.getDefaultHistoryTTL'] = () => ({_: 'defaultHistoryTTL', period: 0});
+H['messages.getFullChat'] = (p) => {
+  const g = groups.get(p.chat_id);
+  if(!g) throw fail(400, 'CHAT_ID_INVALID');
+  return {_: 'messages.chatFull', full_chat: {_: 'chatFull', pFlags: {}, id: p.chat_id, about: '',
+    participants: {_: 'chatParticipants', chat_id: p.chat_id, version: 1,
+      participants: g.members.map((u) => ({_: 'chatParticipant', user_id: u, inviter_id: SELF, date: now()}))},
+    notify_settings: NS()}, chats: [tlChat(p.chat_id)], users: g.members.map(tlUser)};
+};
+
+// -- search (real, over the in-memory store). Media filters return nothing: only text exists for now.
+const isMediaFilter = (f) => f && f._ !== 'inputMessagesFilterEmpty' && f._ !== 'inputMessagesFilterUrl';
+function searchMsgs(p, key) {
+  if(isMediaFilter(p.filter)) return [];
+  const q = (p.q || '').toLowerCase();
+  let list = key ? msgsOf(key) : msgs;
+  if(q) list = list.filter((m) => m.text.toLowerCase().includes(q));
+  if(p.filter?._ === 'inputMessagesFilterUrl') list = list.filter((m) => /https?:\/\//.test(m.text));
+  if(p.from_id) { const f = peerKeyOf(p.from_id); if(f) list = list.filter((m) => 'u' + m.from === f); }
+  if(p.min_date) list = list.filter((m) => m.date >= p.min_date);
+  if(p.max_date) list = list.filter((m) => m.date <= p.max_date);
+  if(p.max_id) list = list.filter((m) => m.id < p.max_id);
+  if(p.min_id) list = list.filter((m) => m.id > p.min_id);
+  return list;
+}
+function searchResult(list, p) {
+  const total = list.length;
+  let page = [...list].reverse();
+  if(p.offset_id > 0) page = page.filter((m) => m.id < p.offset_id);
+  page = page.slice(Math.max(0, p.add_offset || 0), (p.add_offset > 0 ? p.add_offset : 0) + (p.limit || 20));
+  return {_: 'messages.messagesSlice', pFlags: {}, count: total, messages: page.map(tlMessage), topics: [], ...entities(page)};
+}
+H['messages.search'] = (p) => {
+  const key = peerKeyOf(p.peer);
+  return searchResult(searchMsgs(p, key), p);
+};
+H['messages.searchGlobal'] = (p) => searchResult(searchMsgs(p, null), {...p, add_offset: 0});
+H['messages.getSearchCounters'] = (p) => p.filters.map((f) => ({_: 'messages.searchCounter', pFlags: {},
+  filter: f, count: f._ === 'inputMessagesFilterEmpty' ? msgsOf(peerKeyOf(p.peer)).length : 0}));
+
+// -- stories / payments / misc new APIs
+H['stories.getAllStories'] = () => ({_: 'stories.allStories', pFlags: {}, count: 0, state: '', peer_stories: [], chats: [], users: [],
+  stealth_mode: {_: 'storiesStealthMode', pFlags: {}}});
+H['stories.getPeerStories'] = (p) => ({_: 'stories.peerStories', stories: {_: 'peerStories', pFlags: {}, peer: peerFromInput(p.peer), stories: []}, chats: [], users: []});
+H['stories.getPinnedStories'] = noStories;
+H['stories.getStoriesArchive'] = noStories;
+H['stories.getAlbums'] = () => ({_: 'stories.albums', hash: 0, albums: []});
+H['payments.getStarsStatus'] = () => ({_: 'payments.starsStatus', pFlags: {}, balance: {_: 'starsAmount', amount: '0', nanos: 0}, chats: [], users: []});
+H['payments.getSavedStarGifts'] = () => ({_: 'payments.savedStarGifts', pFlags: {}, count: 0, gifts: [], chats: [], users: []});
+H['payments.getPremiumGiftCodeOptions'] = () => [];
+H['photos.getUserPhotos'] = () => ({_: 'photos.photos', photos: [], users: []});
+H['channels.getChannelRecommendations'] = () => ({_: 'messages.chats', chats: []});
+H['folders.editPeerFolders'] = () => updatesOf([]);
+H['communities.getJoinedCommunities'] = () => ({_: 'messages.chats', chats: []});
+
 /* ───────────────────────────── fallbacks for everything else ───────────────────────────── */
 const EMPTY = () => ({
   'Updates': updatesOf([]),
@@ -297,6 +428,36 @@ function fallback(method) {
   return EMPTY()[type] ?? synth(type) ?? true;
 }
 
+
+/* ───────────────────────────── dev validator (VALIDATE=1) ───────────────────────────── */
+// Checks every handler result against the TL schema tweb ships: constructor exists, belongs to the declared type,
+// all non-flag params present, Vectors are arrays, nested constructors recurse. Logs `! schema <method>: ...`.
+function validate(value, type, p, errs, depth = 0) {
+  if(!SCHEMA || !type || depth > 6) return;
+  const v = type.match(/^[Vv]ector<(.+)>$/);
+  if(v) { if(!Array.isArray(value)) errs.push(`${p}: expected array`); else value.slice(0, 3).forEach((x, i) => validate(x, v[1], `${p}[${i}]`, errs, depth + 1)); return; }
+  if(['int', 'long', 'double', 'string', 'bytes', 'Bool', 'true', 'int128', 'int256', 'Object', '!X', 'X', 'JSONValue'].includes(type) || type === '#') return;
+  if(value == null || typeof value !== 'object') { errs.push(`${p}: expected ${type}`); return; }
+  const c = SCHEMA.byPredicate[value._];
+  if(!c) { errs.push(`${p}: unknown constructor "${value._}"`); return; }
+  if(c.type !== type && type !== c.type.replace(/^help\./, 'help.')) errs.push(`${p}: ${value._} is ${c.type}, wanted ${type}`);
+  for(const prm of c.params) {
+    if(prm.type === '#' || /^flags2?$/.test(prm.name)) continue;
+    const opt = prm.type.match(/^flags2?\.\d+\?(.+)$/);
+    const t = opt ? opt[1] : prm.type;
+    if(opt) { if(t === 'true') { if(value[prm.name] !== undefined && !(value.pFlags && value.pFlags[prm.name]) && value[prm.name] !== true) {} continue; } if(value[prm.name] === undefined) continue; }
+    else if(value[prm.name] === undefined) { errs.push(`${p}: ${value._} missing ${prm.name}`); continue; }
+    validate(value[prm.name], t, `${p}.${prm.name}`, errs, depth + 1);
+  }
+}
+function checkResult(method, result) {
+  const type = SCHEMA?.method[method]?.type;
+  if(!type) return;
+  const errs = [];
+  validate(result, type, method, errs);
+  if(errs.length) log(`! schema ${errs.slice(0, 6).join(' | ')}`);
+}
+
 /* ───────────────────────────── HTTP + WS ───────────────────────────── */
 function jsonReplacer(_k, v) {
   if(v instanceof Uint8Array) return {__b64: Buffer.from(v).toString('base64')};
@@ -316,6 +477,7 @@ app.post('/api', async(req, res) => {
   const {method, params = {}} = req.body || {};
   try {
     const result = H[method] ? await H[method](params) : fallback(method);
+    if(process.env.VALIDATE) checkResult(method, result);
     log(`${H[method] ? '·' : '~'} ${method}`);
     res.type('json').send(JSON.stringify({result}, jsonReplacer));
   } catch(e) {
