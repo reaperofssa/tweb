@@ -1,0 +1,31 @@
+services:
+  # Simulated Telegram backend (REST /api + WebSocket /updates)
+  - type: web
+    name: tweb-backend
+    runtime: node
+    rootDir: backend            # own tiny package.json, so only express+ws get installed
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: TWEB_DIR           # the repo root, where src/lib/mtproto/schema.ts lives
+        value: ..
+      - key: PREMIUM
+        value: "1"
+      - key: STARS
+        value: "5000"
+
+  # tweb frontend, built to talk to the backend above
+  - type: web
+    name: tweb-frontend
+    runtime: static
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_FAKE_API
+        sync: false             # set to https://<tweb-backend>.onrender.com after the first deploy
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=450
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
