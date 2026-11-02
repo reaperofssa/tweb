@@ -110,7 +110,7 @@ const flags = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v));
 const tlUser = (id) => {
   const u = users.get(id) || {first_name: 'User ' + id, last_name: '', phone: String(id)};
   return {_: 'user', pFlags: flags({self: id === SELF, contact: id !== SELF, mutual_contact: id !== SELF, premium: id === SELF ? acct.premium : !!u.premium}), id, access_hash: '1',
-    first_name: u.first_name, last_name: u.last_name || '', ...(u.username && {username: u.username}), phone: u.phone,
+    first_name: u.first_name, last_name: u.last_name || '', ...(u.username && {username: u.username}), ...(u.emoji_status && {emoji_status: u.emoji_status}), phone: u.phone,
     status: {_: 'userStatusRecently', pFlags: {}}};
 };
 const tlChat = (id) => ({_: 'chat', pFlags: {}, id, title: groups.get(id).title, photo: {_: 'chatPhotoEmpty'},
@@ -175,7 +175,7 @@ const jb = (key, value) => ({_: 'jsonObjectValue', key, value: {_: 'jsonBool', v
 const jn = (key, value) => ({_: 'jsonObjectValue', key, value: {_: 'jsonNumber', value}});
 H['help.getAppConfig'] = () => ({_: 'help.appConfig', hash: 0, config: {_: 'jsonObject', value: [
   jb('premium_purchase_blocked', false), jb('stargifts_blocked', false), jn('stargifts_convert_period_max', 7776000),
-  jn('stargifts_message_length_max', 255), jn('stars_gifts_enabled', 1)]}});
+  jn('stargifts_message_length_max', 255), jn('stargifts_pinned_to_top_limit', 6), jn('stars_gifts_enabled', 1)]}});
 H['langpack.getDifference'] = H['langpack.getLangPack'] = (p) => ({_: 'langPackDifference', lang_code: p.lang_code || 'en', from_version: 0, version: 0, strings: []});
 
 // -- auth  [WA] later: sendCode -> request pairing code / QR, signIn -> resolves when Baileys 'connection: open'
@@ -195,7 +195,7 @@ const inputUserId = (u) => (u._ === 'inputUserSelf' ? SELF : u.user_id);
 H['users.getUsers'] = (p) => p.id.map((u) => tlUser(inputUserId(u)));
 H['users.getFullUser'] = (p) => {
   const id = inputUserId(p.id);
-  return {_: 'users.userFull', full_user: {_: 'userFull', pFlags: {display_gifts_button: true}, id, stargifts_count: (savedGifts.get(id) || []).length, about: '', settings: {_: 'peerSettings', pFlags: {}},
+  return {_: 'users.userFull', full_user: {_: 'userFull', pFlags: {display_gifts_button: true}, id, stargifts_count: visibleGifts(id), about: '', settings: {_: 'peerSettings', pFlags: {}},
     notify_settings: {_: 'peerNotifySettings', pFlags: {}}, common_chats_count: 0}, chats: [], users: [tlUser(id)]};
 };
 H['contacts.getContacts'] = () => {
@@ -412,7 +412,7 @@ H['communities.getJoinedCommunities'] = () => ({_: 'messages.chats', chats: []})
 const GIFT_ART = [{"title": "Heart", "alt": "\u2764\ufe0f", "stars": 50, "limited": 0, "b64": "UklGRiAEAABXRUJQVlA4TBQEAAAv/8F/EA8wQLM+UvMf8PBb21Ze29q2DQoGJiEQCqFBaIRCCJgYFIYhCcboSPP8X1dE/yeA/u///yad7CUqM8xkZr9XmZlBGl/NFl8DBt+GnXbDBqHe8c688wjjwa0Vvk8AmR/jWn9gq1efeG0+eb2x4FYKPyc9XgwrbYGNVllJK2PFabUVNgu8GrTGknsqS0mLl8NTW2Kjk9fiU1+zOnWNn+aa1+kb9i7zetQZG+6ubCSdueHv6garZN6Md33HapSddDd2nEbd4bu54zX6lr1k3o0aY8tdylbSmFv+UrdYg7fDpe0ZubwXL33PypW9dBl7Tq7u8WXuebkmYIiI94NcF7BEWSDKDQFHVASS3BTwRFWA5VgwEDUJI5UlIlGXsFJFIhENCSdVJZhoSnipJmKIJcNbdRGbRaLUEHFFJElNEV9F+K1YNDQZI5NlYpexMkUmDRn3TlWGp4x/pyYkHGQ6UnyngZTeaSLxOzG0eaOMZd+oYLlfpGL5N2pY4RfpWPEXGVjpF5lY/EeEwc2fDxnN/vVU0Ny/j2Q0+9cToZk/ISYY/QEZWOkX6VjxF2lY4RepWP6NCpZ7o4YVJCqWlyhYTiJj2TciLCMyoUh0IKV36kjxnRpSkKlI/p0KknunjGRlCMkITSB6qYGTpDpOlGo44a0qjpcqOE4q41gpwjFiE4bEB0qS6yhRrqEEuYri5QqKk8soVo5QjMIEIcWBkTQ6RtSoGF6jYDiNjGE1CMOoTAhSHQhJpyPEd2sIQacieJ2C4HQygtUhBKM0Aejlhl7S6npRq+kFrarntYqe08p69u1Iz6hNNVIfWkmva0W9phX0qpZ/v6Ll9LKW1SMtAzCVCHDoJISuE7+g6QSEquMRio5DyDoWgXQMxFShTxgaCaNrRIymETCqhscoGg4ja9hvIA0DMhUIdMgllC4XUZpcQKly/iuKnEPJchaF5AzMFCPYIZVwulT8jiYVcKqUxylSDidLWRySMkBTiD5kyCSkLhORmkxAqjIeqcg4pCxjv4RkDNQUIeghkbC6RMRqEgGrSvhvKRIOK0tYLJIwYFOAwMdeQut78WvaXkCrex6t7Dm0vGfRaM/AzS36nLGT8PpOxGs7Aa/ueLyy4/Dyjv0e2jEHzA06cKylE/paPKGthRPqmv+isuZOyGv2BFozR8wlOnKspDP6SvymthLOqCv+jLLizsgr9gxaMYfMBfqo8ZRO6U/xlPYUTqlP/pTy5E7JT/ar6MkcMx/o2HGXzul38Zx2F86pd/67yp07J9/Zc+jOHDRv6OBxSSf1S/yydgkn1Ys/qVzcSfliT6KLOWoyM33aYE5ndeZ4VmMOZ1Vmf1ZhdmdlZvttxGwOm0yHj3Raj6e1cFr1X1fcadmeRua4//v/L1A="}, {"title": "Star", "alt": "\u2b50", "stars": 100, "limited": 0, "b64": "UklGRroDAABXRUJQVlA4TK4DAAAv/8F/EA8wxPM/KPMf8PDe2lYm27a1dcSS+IkDS2KZ8b0wDUzDFEzgJz8Q/UdmEr03goz1sT8i+j8B9H////1pTpft6Yo7Xd3Pn66F0/X47Y10usmn4xswZ8vM9mzlDtzZKrM/W7uDsFe/g3i2wZzONu+Az8bMbE6W78HuVO7Bnazeg9+p3UM4Wb+HuNO4h7TTvAc+Gd+E2SffhT1XuQu3T70Lv0/7FsI+/S7iPuNbSPvMu+B9+DbMLvl7sLuU+3C71O/B79LuI+zSjzc+xeOlXebxePF8Zo98J3aPcry64o7n92jH6yvheHGPcby5ks7Ey19ZXjMnKmv2eG6Hery25k/U18J5Cl+2YIMFI1JlYQczWTxhNFb1AKyu1RkwaGQGNWKDYaNMYWgrMBk8XRto8VpHC9cqmrtW0Oy1jGauERoJTqwkMbCiRMPyEhXLSRQsK5GxjARhkehAijIdKcg0JC9TkZxMQbIyGcnI0MRJJDxwolTHCVINx0tVHCdVcKwU4ZD4RElyAyXKdZQg11C8XEGxchnFyBEKKU6MpDEwokbHCBoVw2kUDKuRMYwGYZDqREg6HSHoNASvUxGcTkGwOhnB6BACKQ+9qNX1glbT81pVz2kVPatFeqQ+tZLe0Ip6XSvoNS2vV7WcXtYyeqRFgFMnIQydiNB1AkLVcQhFxyJkHYNAOgQ5NRLG0IgYTcNjVA2HUTQsRtYwGKRBoFMuoXS5gNLkPEqVcyhFzqJkOYNCUyoR7JCKOF0q4DQpj1OlHE6RsjgkRcBTJiENmfhNTZn0pFj4QWUp85yKlH1OVcr9ddKk/HPqUuE5Dan4nKZUek4s/piynPmrpMjZp1Tl3FNqcv4pdbnwjaWxw1iKfSnu4OtuNu9maLNENDaYK4GoraQNPFHdyxLlvYiINuDF9DIWGC+8tJ3cS93JvmS4vEJv54JBi+/GPuFd28e9K2hlwbzLCxaNPs5d4qe+i//UwOon96l8cmDmE22SaHHuEVf6Hn6lYbUPdqV88FhmhbZItDx3CGsdqr/za/VdgLJrZQe6uEG6MpDGm3Clv4lI/krFs1cyHl1Gmi/p2nhJQOFaQ3PXKpq9loH4lQQnMzNOlBhYQaJhOYkKk1+MRH4xMCQ6kaLMQPIyDcnJFJTCzEYmM7MFSSQ8caJUx/FSDaQyW6nC7ECMFMEkEp8oQa5jNPZylT2GlSsopAiSNCZEDxo9QDiNimE1CgapQvyu8zvCjzo/I/yg8xPC//3/73s="}, {"title": "Gift Box", "alt": "\ud83c\udf81", "stars": 250, "limited": 0, "b64": "UklGRpYCAABXRUJQVlA4TIoCAAAv/8F/EBcgIEn8D23uhkAgSXB/nOd//gP+ArKrbW/bBnQ377EEp9AIaXDKCJmCS+g+vWBNFXz/938/oVRE9B+CG0mSIjeoKWoWJef2zPwghR/Df8N/oxbPSslYljBelcPAsoS5fSRjWWIoJ2PCssS473RgWULMZ0xYlgD9czKWJdJcyoRlUbc77xbLIl+fl7EskepSJiyLeN1yi2URr1sylkX9R681sCzinaYJyyLdabvFskh32jKWJVKnFCxLzxTAhGUR3hJxi2Xpl2fIpy1jWYS3hH7tsCzCoP92jSzyCP/t5f+QsNp5Jm5nWu21kslirHZPiD9W658AliXLYuxtPNP26vRNPd8As8ii7O31jWVvG3hteia3/g0DWXpmd/qbCjzULRDuQkU62tYzz5hyzzTX4UiWvwT1//9e/9c9l/+6u//7ff3f7+/+cZ/4x93iH3eMf9w1/nHn+Mfd4593iH/eJfx5p/jn3eKfd+zAedcPFRzvC2l8RVMvRGuFB8tPOPXM8wP3RFLxQZxlzbS+wTuOvcHCrF03/Frdy2oZpC0trmgd50a1mGkd38beZKF1fBtfTaq/Sun4qzbvGLXNFYlv+dXfalSd6zoLeGev5VXzLOCD2ZP1R89qUVCNswhSe3/e29O+CNJdtfF6n2RRQbm5ry3HWVTQBvJ5G/7rhVXbfAlJ2q420Q9paRN9ULaQzjsKcD/xrOwqkRrCaOfdXfA6pIYLXodVykqJNnngzbS2A1afeeHjXIf/hv+G/4b/hv/+v2ZVNP9aSYquNtYPQWljfdCzsK165q2V9FzR/ZCTEn1DNQvfykbp8EsyRu1QkhFqj6HlKrlMXITZ50JlvoYfw3/Df382JA=="}, {"title": "Diamond", "alt": "\ud83d\udc8e", "stars": 500, "limited": 1, "b64": "UklGRqIFAABXRUJQVlA4TJUFAAAv/8F/EBcgEEjyN5tqDYFAktj+WAsEkvxFx1ggkES383YBf9UcBW3bMA5/3DsQImICzKkQLVL4I9m1bcdtoyAz+siEflgaS8AHX5uekvBu4NMR/YfCSJIjKQ+l6nbhmzXdheU2gBtGkkq7JmQcFF14UBUshSExXf6tTA5JRR9F9N8J20iSZB5at//xB/959593//kf7IPO12ednx8662w28k+30ecYNjaPywZ/Gp3secxO+0fRvuZxVoMdzzyOglVPA04w/1xwgJfm+v6YrtqnfDqQVTiaetajPI6qjiaegSaf8gxL9X2aqKpvkH6UZ2gqAk1MjvIVVicTzJeLDBCpJvp+m6JqBFQ7Sy8sMXnejvICYXTMz9IPC3NK43x7JqeKswzCQSWcovxVeiGmyhqYY7ouTPEq/ZA6qfC6lSzfaQXgPFfF36UfPlfJMQOXpJZRUrIjEwokpxPulFHoKJwyChkVHqOKd0mGA0iyikl2bL4MFF+xsxC1DEThlXFoqFToRoJJuIzAvJIPK9xLdMIX4yxBLUlQuGUirAYkmJQLCLTKAHxzZr5KnZ7rbsmF8Wp+mQsrNinU0h2TdKWrVap036wZrgK/ZMPsk2qtEZkEZTqsSC/WE90vC8IR7Zs3oxXlWnKyeGdyoFWCA0QlH76uuY6ZcOWqlslVi8qasMKSFi0ricpMmBpYWGbCVEWTFuqYKVeoapcRlIRlWVihyco5MwPtM2I8LnNhpKJRSzlrWBaG1ROTnTUTA+tUIR6X2TBPtdeIcKLMhnmKuKwNqwUk3Xqc77wZp2jX7neizIdhqiDK6nDcnvSr2xOiLAizAr3ByPJdYWYpmLIiTFK5Q783YcqGcNya3KGSHLPE9Rca5LvGDFLrEqSgypaw2m3JPfp9CVX2hCPGMYtcKSo36Sm+q8wUtZvUTQlXdoXVQpKnylEZgd2lMhyzzBWhcpt+x1m5sjEcEcmqc0YEuE77/06WneH4736fCnDMQleA2oV8We1X5D79v3Pf7nT/557/c///c9vvXvm/d/2/O/y/u3wW/Hev3mWsGLnrvKv7//f58P93+9cdfPzrPv51r0Vj91x3LP+6p49/3dm/7u7fd+Dx7/v4973WzbhF8+978vj3nf377j7+cw/+cx9LR28wbn7s64bnfrqP/9yV/9zZ4tH+5w7H6p97HP2a/9zp8p+71W4jgO7nnof/3LX/3HkCzc/dtw0896+9hv/exQ7eOxm9Wgat7/00/r0j/72rEDrfOxv+e2/+e3/+e488u3jvVPr0XTDQ9t5z89+75vHfe/ff+/fx5y74cycWQNCBPd/9GP7cER9/7gs/98af++Pjz13y505tBmvgzx3z8ee++XPvfPi5g/7cxf0gNbIHj1Z/d7P58HNP/bmvO0Jqv/vbdzR3eFgpf+7znuZeS6UeSuV3x7s/99yf+x7PSs/urubuS53u7z1YwN6H2C+WeeSD7Oz6ez/8vSfBVP3vS/f3zvB7d/y9Qz472/s0arQVIByYmj1/75mPv3fO37vnw+899Pc+7g7J/+9m9/d++vB7V/29s/7eXR9/77G/93kBAAfmDH/vt4+/d93fO8/j7/33ew/skcF5eaT0xUXN7oPH7x3h965YAdSBzOy1bfb+UNaAIIbv+ZH77J0yWA0iHr6Tw0h+7xqOHc7u2GnvncFpfu+grfYuUsbAiIb32ZF+7ya/dxRGMLyniBH83lt+7y+fFfQu074YeiwA7kB3+J6O9HvH+fi97/zeezx+70C/d+EKMA90Zrf5vRt5/N6Tfu9Lv/emD9871O9dumvkrfu9W3343rN+71sfv3ev3zt449iBrh295zGHj9/72e89vXXsOWrvvbvlObrfe9zvfY7zfT5wfqff+333vefl+wJ65/Ofd/9595EBAA=="}, {"title": "Cake", "alt": "\ud83c\udf82", "stars": 150, "limited": 0, "b64": "UklGRuYBAABXRUJQVlA4TNoBAAAv/8F/ECegoG0bpuhK8Y7raAgJEv4PtkqYbTSdfUdy/jI3/wH4X0RzxSGxjSRHktQbIA1QHvw7IP236ra77zCZNQK/1SjRFdH/CXhQ/6v/1f/q//+AfvnmLjp/8UlufjOl5o0ps2pxmXlzSqzaXGLemfKqHj/evDulVX1+tPnAPNfVCL/W+dC8q6uG2KXORuTJrgbYwWZ9Ka7qssPNelJg1WESb0uRVZPJvCWF9vPWj2ep1UtZcqvv7l4luZvqP/Wf+u+OrA9vvuXTeuuPlCywzseC62wswM7Fe0SLiliYmVignYdAtXhYsJ2FwLWOggXcOQhk6xhY0P0ICGzrCrTAu/pP/af+OwcFOLsAGTY/BAKaHQKGzKH9+nf7M7BoxJPRykEEmIx2XL/bAkr0OqzofYcjuwJVdQWMjH4HFQNRxEiHFCMnhhwSiGpIYIjBeCrGTgQ5KtBUjEYQr4ikYvzcvnwNErcv6J1bl/zE3hUEz21LhuLcEhTPPSs5iitLkDzVf+o/9Z/6T/2n/lP/3b+QJNmFxTiau1ZSZKcWY2huXBJkO5fxMzcv6bHtZ2cCSHIMITcTQlJjGJmZIJIYQ5m0GE5WJhBLSgxrEmJwkwxT/6v/1f/qf/X/zgs="}, {"title": "Ball", "alt": "\ud83d\udd2e", "stars": 1000, "limited": 1, "b64": "UklGRuYDAABXRUJQVlA4TNkDAAAv/8F/EBcgEEjy3J9jDYFAkr/AuAsEkvxFx1ggkIS9wdoBf9UcA2nbtP5tb/slRMQE0E0G34BWIUdgGzfC4IlSUDpLXYDMubsR/Z8AyJFk122QJPxBCIziJcH7u7DqcdO0ADzuW5avEf2fAPz7/9//fzw0fNRWjkVvZNjUOo5tLxPIXCWQu0ggew1HupdwPOgVDI9qg3hmFnA87HqGx9UunptyBkJ1AyWbOYebgZS9nMW9QMtWzuNWIGYnZ3KnYJpKBmo1Cq5pBHL2cTb3AT3bGJ/aBN+0QUF2sQrqEhWmC0qyidVQk6gxTVCUPayKekSV6YGybGF11MLruEXUmRYozA5eyR2i0nRAaTawWmrgtdwgVo7eO9s0wOLof28y5tnC0T+TKc8X+vTkcl7MxqzfVJOHeV88uZhms7HSbyql+exr6aJyWkyOvk41LcbG/SKYfm1cVMyyydF3qZTlk7F1MzkrJl9bF9NkYdq3Tyom2eTY61S6nE9Gws3kpJh8JVxMk4RpTzypeDebHBmdSjk+GSk3k3NCxeR9pVyvABlMsVlPPamU4jqcduT0NwgdkwIhDBtJtz5Topv57CvponJGKJmbQQovZgs9+eRSgmvxxULLXAxieC9To3u5Gt8r1My9sPqVdLHxWqZHzxZfGkk3m68VeibpSII4COLhkHOKM0VK+kq5/jm+MVJuPt8qNo4UFExCxvnfwe5XwlWBSSPhfpkjAf8c28LeWUJRX1vX64ytW53vHVso6Sh8bVwvNDbuFzo2IC8S8LV0FZmwsXS/ElZOvNNYuF8AubMTZZl2TPBaGB/uF8PRe0flAuV/kKnS+4Sr8udEqJrvCZDNf5OELHxNcFX+nDBVep9oqvhGEaLwQnFNfqWYJj1Tmia+VEISniquyLcyRXquNEV8soQgHMv1+FqmR8+WpofnCjk4l6vxvUyN7tXU8GAhBgdzLb6YaVFC08KThRSczJU4w5ToZk0JjxZCEOo6fDXToZSmgzEhA2dzFc4xFcppKni4EIFg1+Ak06DLNQ2MCgmIdgXOMgXKagoYFgJwPK/nNKuntFaPcVEO8V7NeVZNea0aC0QxFPRabmC11KDVYoUohYpeyR1aJZaIQijpddzC6qhFq8MaUQY1rYp6tCosEkVQ1GqoSavBKlECVa2CurQKLBMFUNb41KbxsY6zGX3ZWCjIUNi41KgFFSo7kzs1JpZyHqM1D2s5i9GbhcWcw2jOwWrGIHQPApS359Su+VNG/3gIC9oz2qD5E8aOnmdsGWnYM5KwaaRgV98ztrUdYWFfMZa2T8K////9/8s7AA=="}];
 const stickerBytes = new Map(); // document id -> Uint8Array (served by upload.getFile)
 const tlStars = () => ({_: 'starsAmount', amount: String(acct.stars), nanos: 0});
-const CATALOG = GIFT_ART.map((g, i) => {
+const FAKE_CATALOG = GIFT_ART.map((g, i) => {
   const bytes = Buffer.from(g.b64, 'base64'), docId = String(9000000 + i);
   stickerBytes.set(docId, new Uint8Array(bytes));
   const doc = {_: 'document', pFlags: {}, id: docId, access_hash: '1', file_reference: new Uint8Array(0), date: now(), mime_type: 'image/webp',
@@ -420,25 +420,65 @@ const CATALOG = GIFT_ART.map((g, i) => {
       {_: 'documentAttributeSticker', pFlags: {}, alt: g.alt, stickerset: {_: 'inputStickerSetEmpty'}}]};
   const total = 1000, remains = 1000 - i * 37;
   return {_: 'starGift', pFlags: flags({limited: g.limited}), id: String(5000 + i), sticker: doc, stars: String(g.stars), convert_stars: String(Math.floor(g.stars / 2)),
-    ...(g.limited && {availability_remains: remains, availability_total: total}), title: g.title};
+    ...(g.limited && {availability_remains: remains, availability_total: total}), title: g.title, upgrade_stars: String(Math.max(10, Math.floor(g.stars / 4)))};
 });
+/* Real data: produced once by export_real.js (run in a browser logged into a REAL Telegram account) -> real_data.json.
+ * {gifts: [starGift], docs: {id: document}, files: {id: base64}, defaultStatuses: [emojiStatus], recentStatuses: [emojiStatus]} */
+function loadReal() {
+  const file = process.env.REAL_DATA || path.join(__dirname, 'real_data.json');
+  if(!fs.existsSync(file)) return null;
+  const rev = (_k, v) => (v && typeof v === 'object' && typeof v.__b64 === 'string' ? new Uint8Array(Buffer.from(v.__b64, 'base64')) : v);
+  const r = JSON.parse(fs.readFileSync(file, 'utf8'), rev);
+  log(`real data: ${r.gifts?.length || 0} gifts, ${Object.keys(r.docs || {}).length} documents, ${Object.keys(r.files || {}).length} files, ` +
+    `${r.defaultStatuses?.length || 0} default / ${r.recentStatuses?.length || 0} recent emoji statuses`);
+  return r;
+}
+const REAL = loadReal();
+const CATALOG = REAL?.gifts?.length ? REAL.gifts : FAKE_CATALOG;
+const docsById = new Map(); // document id -> Document (for messages.getCustomEmojiDocuments)
+for(const g of FAKE_CATALOG) docsById.set(g.sticker.id, g.sticker);
+if(REAL) {
+  for(const [id, bytes] of Object.entries(REAL.files || {})) stickerBytes.set(String(id), new Uint8Array(Buffer.from(bytes, 'base64')));
+  for(const [id, doc] of Object.entries(REAL.docs || {})) docsById.set(String(id), doc);
+  for(const g of CATALOG) if(g.sticker) docsById.set(String(g.sticker.id), g.sticker);
+}
 const giftById = (id) => CATALOG.find((g) => g.id === String(id));
 
 H['payments.getStarsStatus'] = () => ({_: 'payments.starsStatus', pFlags: {}, balance: tlStars(), chats: [], users: []});
-H['payments.getStarGifts'] = (p) => (p.hash === 1 ? {_: 'payments.starGiftsNotModified'} : {_: 'payments.starGifts', hash: 1, gifts: CATALOG, chats: [], users: []});
+/** A limited gift lists its resale market the way real Telegram does: availability_resale (how many) + resell_min_stars (floor price). tweb then shows a second "resale" tile for it. */
+const withResale = (g) => {
+  if(!(g.pFlags?.limited || g.availability_resale) || !g.upgrade_stars) return g;
+  const pool = resalePool(g.id);
+  if(!pool.length) return g;
+  return {...g, availability_resale: String(pool.length), resell_min_stars: String(Math.min(...pool.map((u) => +u.resell_amount[0].amount)))};
+};
+H['payments.getStarGifts'] = (p) => (p.hash === 1 ? {_: 'payments.starGiftsNotModified'} : {_: 'payments.starGifts', hash: 1, gifts: CATALOG.map(withResale), chats: [], users: []});
 H['payments.getStarGiftCollections'] = () => ({_: 'payments.starGiftCollections', collections: []});
 H['payments.checkCanSendGift'] = () => ({_: 'payments.checkCanSendGiftResultOk'});
 
+const visibleGifts = (uid) => (savedGifts.get(uid) || []).filter((g) => !g.unsaved).length; // what a profile shows (count in userFull)
+const isUniqueGift = (g) => g.gift._ === 'starGiftUnique';
 H['payments.getSavedStarGifts'] = (p) => {
-  const key = peerKeyOf(p.peer), uid = key && key[0] === 'u' ? +key.slice(1) : SELF;
-  let list = (savedGifts.get(uid) || []).filter((g) => !g.unsaved || !p.pFlags?.exclude_unsaved);
-  if(p.pFlags?.exclude_unsaved) list = list.filter((g) => !g.unsaved);
-  if(p.pFlags?.exclude_saved) list = list.filter((g) => g.unsaved);
-  const page = list.slice().reverse().slice(0, p.limit || 50);
-  return {_: 'payments.savedStarGifts', pFlags: {}, count: list.length, gifts: page.map(tlSavedGift), chats: [], users: [...new Set(page.map((g) => g.from))].map(tlUser)};
+  const key = peerKeyOf(p.peer), uid = key && key[0] === 'u' ? +key.slice(1) : SELF, f = p.pFlags || {};
+  let list = (savedGifts.get(uid) || []).slice();
+  if(uid !== SELF) list = list.filter((g) => !g.unsaved);            // other people never see what the owner hid
+  if(f.exclude_unsaved) list = list.filter((g) => !g.unsaved);
+  if(f.exclude_saved) list = list.filter((g) => g.unsaved);
+  if(f.exclude_unique) list = list.filter((g) => !isUniqueGift(g));
+  if(f.exclude_unlimited) list = list.filter((g) => g.gift.pFlags?.limited || isUniqueGift(g));
+  if(f.exclude_upgradable) list = list.filter((g) => !g.gift.upgrade_stars);
+  if(f.exclude_unupgradable) list = list.filter((g) => g.gift.upgrade_stars);
+  const value = (g) => +(g.gift.stars || 0);
+  list.sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || (f.sort_by_value ? value(b) - value(a) : 0) || b.date - a.date || b.msg_id - a.msg_id);
+  const total = list.length, from = +p.offset || 0, limit = p.limit || 50, page = list.slice(from, from + limit);
+  return {_: 'payments.savedStarGifts', pFlags: {}, count: total, gifts: page.map(tlSavedGift), ...(from + limit < total && {next_offset: String(from + limit)}),
+    chats: [], users: [...new Set([...page.map((g) => g.from), uid])].map(tlUser)};
 };
-const tlSavedGift = (g) => ({_: 'savedStarGift', pFlags: flags({unsaved: g.unsaved}), from_id: {_: 'peerUser', user_id: g.from}, date: g.date, gift: g.gift,
-  ...(g.message && {message: g.message}), msg_id: g.msg_id, saved_id: String(g.msg_id), convert_stars: g.gift.convert_stars});
+const tlSavedGift = (g) => ({_: 'savedStarGift', pFlags: flags({unsaved: g.unsaved, name_hidden: g.nameHidden, pinned_to_top: g.pinned, can_upgrade: !isUniqueGift(g) && g.canUpgrade}),
+  ...(!g.nameHidden && {from_id: {_: 'peerUser', user_id: g.from}}), date: g.date, gift: g.gift, ...(g.message && {message: g.message}),
+  msg_id: g.msg_id, saved_id: String(g.msg_id), ...(!isUniqueGift(g) && g.gift.convert_stars && {convert_stars: g.gift.convert_stars}),
+  ...(!isUniqueGift(g) && g.canUpgrade && {upgrade_stars: g.prepaid ? undefined : g.gift.upgrade_stars}),
+  ...(isUniqueGift(g) && {can_transfer_at: now() - 1, can_resell_at: now() - 1})});
 const findSaved = (input) => { for(const list of savedGifts.values()) { const g = list.find((x) => x.msg_id === input?.msg_id); if(g) return g; } };
 H['payments.saveStarGift'] = (p) => { const g = findSaved(p.stargift); if(g) g.unsaved = !!p.pFlags?.unsave; return true; };
 H['payments.convertStarGift'] = (p) => {
@@ -448,7 +488,12 @@ H['payments.convertStarGift'] = (p) => {
   return true;
 };
 H['payments.toggleChatStarGiftNotifications'] = () => true;
-H['payments.toggleStarGiftsPinnedToTop'] = () => true;
+H['payments.toggleStarGiftsPinnedToTop'] = (p) => {
+  const key = peerKeyOf(p.peer), uid = key && key[0] === 'u' ? +key.slice(1) : SELF;
+  const ids = new Set((p.stargift || []).map((x) => x.msg_id));
+  for(const g of savedGifts.get(uid) || []) g.pinned = ids.has(g.msg_id) && isUniqueGift(g);
+  return true;
+};
 
 // Sending a gift = getPaymentForm (invoice) -> sendStarsForm (pay). Real Telegram does the same dance.
 const forms = new Map();
@@ -460,28 +505,31 @@ H['payments.getPaymentForm'] = (p) => {
   const id = String(Date.now() + forms.size);
   forms.set(id, inv);
   return {_: 'payments.paymentFormStarGift', form_id: id, invoice: {_: 'invoice', pFlags: {}, currency: 'XTR',
-    prices: [{_: 'labeledPrice', label: gift.title, amount: gift.stars}]}};
+    prices: [{_: 'labeledPrice', label: gift.title, amount: gift.stars},
+      ...(inv.pFlags?.include_upgrade && gift.upgrade_stars ? [{_: 'labeledPrice', label: 'Upgrade', amount: gift.upgrade_stars}] : [])]}};
 };
 H['payments.sendStarsForm'] = (p) => {
   const inv = forms.get(String(p.form_id)) || p.invoice, gift = giftById(inv?.gift_id);
   if(!gift) throw fail(400, 'FORM_EXPIRED');
-  if(acct.stars < +gift.stars) throw fail(400, 'BALANCE_TOO_LOW');
+  const prepaid = !!(inv.pFlags?.include_upgrade && gift.upgrade_stars), cost = +gift.stars + (prepaid ? +gift.upgrade_stars : 0);
+  if(acct.stars < cost) throw fail(400, 'BALANCE_TOO_LOW');
   const key = peerKeyOf(inv.peer);
   if(!key) throw fail(400, 'PEER_ID_INVALID');
-  acct.stars -= +gift.stars;
+  acct.stars -= cost;
   if(gift.availability_remains) gift.availability_remains--;
-  const m = recordGift(key, SELF, gift, inv.message, inv.pFlags?.hide_name);
+  const m = recordGift(key, SELF, gift, inv.message, inv.pFlags?.hide_name, {prepaid});
   forms.delete(String(p.form_id));
   return {_: 'payments.paymentResult', updates: updatesOf([{_: 'updateNewMessage', message: tlMessage(m), pts, pts_count: 1},
     {_: 'updateStarsBalance', balance: tlStars()}], [m])};
 };
 /** Creates the service message + saved-gift record. recipient = the user in `key` (or SELF when `from` is someone else). */
-function recordGift(key, from, gift, message, nameHidden) {
+function recordGift(key, from, gift, message, nameHidden, opts = {}) {
   const to = from === SELF ? +key.slice(1) : SELF;
-  const m = addMessage(key, from, '', now(), {action: {_: 'messageActionStarGift', pFlags: flags({name_hidden: nameHidden, saved: true}),
-    gift, ...(message && {message}), convert_stars: gift.convert_stars, from_id: {_: 'peerUser', user_id: from}}});
+  const canUpgrade = !!gift.upgrade_stars && to === SELF;
+  const m = addMessage(key, from, '', now(), {action: {_: 'messageActionStarGift', pFlags: flags({name_hidden: nameHidden, saved: true, can_upgrade: canUpgrade}),
+    gift, ...(message && {message}), convert_stars: gift.convert_stars, ...(opts.prepaid && {upgrade_stars: gift.upgrade_stars}), from_id: {_: 'peerUser', user_id: from}}});
   if(!savedGifts.has(to)) savedGifts.set(to, []);
-  savedGifts.get(to).push({msg_id: m.id, from, date: m.date, gift, message, unsaved: false});
+  savedGifts.get(to).push({msg_id: m.id, from, date: m.date, gift, message, unsaved: false, nameHidden: !!nameHidden, key, canUpgrade, prepaid: !!opts.prepaid});
   return m;
 }
 // NOTE for REAL gift data: the catalog above is fake art. To mirror Telegram's real catalog, log in once with a real
@@ -494,6 +542,207 @@ H['upload.getFile'] = (p) => {
   const off = p.offset || 0;
   return {_: 'upload.file', type: {_: 'storage.fileWebp'}, mtime: now(), bytes: bytes.subarray(off, off + (p.limit || bytes.length))};
 };
+
+/* ── emoji statuses (premium) ── */
+const statusList = (list) => ({_: 'account.emojiStatuses', hash: '1', statuses: list || []});
+H['account.getDefaultEmojiStatuses'] = (p) => (p.hash === '1' && REAL ? {_: 'account.emojiStatusesNotModified'} : statusList(REAL?.defaultStatuses));
+H['account.getRecentEmojiStatuses'] = (p) => (p.hash === '1' && REAL ? {_: 'account.emojiStatusesNotModified'} : statusList(REAL?.recentStatuses));
+H['account.clearRecentEmojiStatuses'] = () => true;
+H['account.updateEmojiStatus'] = (p) => {
+  if(!acct.premium) throw fail(400, 'PREMIUM_ACCOUNT_REQUIRED');
+  const st = p.emoji_status, me = users.get(SELF);
+  if(!st || st._ === 'emojiStatusEmpty') delete me.emoji_status; else me.emoji_status = st;
+  push(updatesOf([{_: 'updateUserEmojiStatus', user_id: SELF, emoji_status: me.emoji_status || {_: 'emojiStatusEmpty'}}]));
+  return true;
+};
+H['messages.getCustomEmojiDocuments'] = (p) => p.document_id.map((id) => docsById.get(String(id))).filter(Boolean);
+H['messages.searchCustomEmoji'] = () => ({_: 'emojiList', hash: '0', document_id: []});
+H['messages.getEmojiGroups'] = H['messages.getEmojiStickerGroups'] = H['messages.getEmojiStatusGroups'] = H['messages.getEmojiProfilePhotoGroups'] =
+  () => ({_: 'messages.emojiGroups', hash: 0, groups: []});
+
+/* ── stars wallet screens + misc ── */
+H['payments.getStarsTopupOptions'] = () => [];
+H['payments.getStarsGiftOptions'] = () => [];
+H['payments.getStarsSubscriptions'] = H['payments.getStarsTransactions'] = () => ({_: 'payments.starsStatus', pFlags: {}, balance: tlStars(), history: [], chats: [], users: []});
+H['bots.getPopularAppBots'] = () => ({_: 'bots.popularAppBots', pFlags: {}, users: []});
+H['messages.saveDraft'] = () => true;
+H['messages.getRecentStickers'] = () => ({_: 'messages.recentStickers', hash: '0', packs: [], stickers: [], dates: []});
+H['messages.getAllStickers'] = () => ({_: 'messages.allStickers', hash: '0', sets: []});
+
+/* ───────────────────────────── collectible gifts ("NFTs": starGiftUnique) ─────────────────────────────
+ * A regular gift with upgrade_stars can be upgraded into a unique gift: a random model + pattern + backdrop, a number and a slug.
+ * Attribute pools come from real_data.json (upgradePreviews) when present, else from generated placeholders. */
+const FAKE_ATTRS = (() => {
+  const rar = (i) => ({_: 'starGiftAttributeRarity', permille: 20 + i * 40});
+  const colors = [['Emerald', 0x2e8b57, 0x14573a, 0x8fe3b3], ['Sapphire', 0x3a6fd8, 0x1b3c8a, 0x9cbcff], ['Ruby', 0xd83a4f, 0x7d1626, 0xffa3b0], ['Amber', 0xe0a030, 0x7f5510, 0xffe29a],
+    ['Violet', 0x8a4fd8, 0x45207f, 0xd3b3ff], ['Onyx', 0x40454f, 0x15171c, 0x9aa1b0]];
+  return {
+    models: FAKE_CATALOG.map((g, i) => ({_: 'starGiftAttributeModel', pFlags: {}, name: g.title, document: g.sticker, rarity: rar(i)})),
+    patterns: FAKE_CATALOG.slice(0, 4).map((g, i) => ({_: 'starGiftAttributePattern', name: g.title + ' Pattern', document: g.sticker, rarity: rar(i)})),
+    backdrops: colors.map(([name, center, edge, text], i) => ({_: 'starGiftAttributeBackdrop', name, backdrop_id: 100 + i, center_color: center, edge_color: edge,
+      pattern_color: edge, text_color: text, rarity: rar(i)}))
+  };
+})();
+function attrsFor(giftId) {
+  const sample = REAL?.upgradePreviews?.[String(giftId)]?.sample_attributes;
+  if(!sample?.length) {
+    const gift = giftById(giftId);
+    if(!gift?.sticker || FAKE_CATALOG.includes(gift)) return FAKE_ATTRS;
+    const rar = (permille) => ({_: 'starGiftAttributeRarity', permille});
+    return {models: [{_: 'starGiftAttributeModel', pFlags: {}, name: gift.title || 'Classic', document: gift.sticker, rarity: rar(100)}],
+      patterns: [{_: 'starGiftAttributePattern', name: gift.title || 'Classic', document: gift.sticker, rarity: rar(100)}], backdrops: FAKE_ATTRS.backdrops};
+  }
+  const by = (t) => sample.filter((a) => a._ === t);
+  const models = by('starGiftAttributeModel'), patterns = by('starGiftAttributePattern'), backdrops = by('starGiftAttributeBackdrop');
+  return {models: models.length ? models : FAKE_ATTRS.models, patterns: patterns.length ? patterns : FAKE_ATTRS.patterns, backdrops: backdrops.length ? backdrops : FAKE_ATTRS.backdrops};
+}
+const pickOne = (a) => a[Math.floor(Math.random() * a.length)];
+let uniqueSeq = 0;
+const issued = {};
+/** Mints a unique gift of `gift` owned by user `owner`. */
+function mint(gift, owner, details) {
+  const {models, patterns, backdrops} = attrsFor(gift.id), num = (issued[gift.id] = (issued[gift.id] || 0) + 1), title = gift.title || 'Gift';
+  return {_: 'starGiftUnique', pFlags: {}, id: String(700000 + ++uniqueSeq), gift_id: gift.id, title, slug: title.replace(/[^A-Za-z0-9]/g, '') + '-' + num, num,
+    owner_id: {_: 'peerUser', user_id: owner}, attributes: [pickOne(models), pickOne(patterns), pickOne(backdrops), ...(details ? [details] : [])],
+    availability_issued: num + 100, availability_total: gift.availability_total || 1000};
+}
+const findSavedRec = (input) => {
+  for(const [uid, list] of savedGifts) for(const g of list) {
+    if(input?._ === 'inputSavedStarGiftSlug' ? g.gift.slug === input.slug : g.msg_id === input?.msg_id) return {uid, g};
+  }
+};
+const usersOf = (ids) => [...new Set(ids)].map(tlUser);
+
+H['payments.getStarGiftUpgradePreview'] = (p) => {
+  const gift = giftById(p.gift_id);
+  if(!gift) throw fail(400, 'GIFT_INVALID');
+  const real = REAL?.upgradePreviews?.[String(p.gift_id)];
+  if(real) return {_: 'payments.starGiftUpgradePreview', sample_attributes: real.sample_attributes, prices: real.prices || [], next_prices: real.next_prices || []};
+  const a = attrsFor(gift.id);
+  return {_: 'payments.starGiftUpgradePreview', sample_attributes: [...a.models, ...a.patterns, ...a.backdrops],
+    prices: [{_: 'starGiftUpgradePrice', date: now() - 3600, upgrade_stars: gift.upgrade_stars || '25'}], next_prices: []};
+};
+H['payments.getStarGiftUpgradeAttributes'] = (p) => {
+  const a = attrsFor(p.gift_id);
+  return {_: 'payments.starGiftUpgradeAttributes', attributes: [...a.models, ...a.patterns, ...a.backdrops]};
+};
+
+H['payments.upgradeStarGift'] = (p) => {
+  const hit = findSavedRec(p.stargift);
+  if(!hit) throw fail(400, 'STARGIFT_INVALID');
+  const {uid, g} = hit;
+  if(uid !== SELF) throw fail(400, 'STARGIFT_FORBIDDEN');
+  if(isUniqueGift(g)) throw fail(400, 'STARGIFT_ALREADY_UPGRADED');
+  if(!g.gift.upgrade_stars) throw fail(400, 'STARGIFT_UPGRADE_UNAVAILABLE');
+  const price = g.prepaid ? 0 : +g.gift.upgrade_stars;
+  if(acct.stars < price) throw fail(400, 'BALANCE_TOO_LOW');
+  acct.stars -= price;
+  const details = p.pFlags?.keep_original_details ? {_: 'starGiftAttributeOriginalDetails', pFlags: {}, ...(!g.nameHidden && {sender_id: {_: 'peerUser', user_id: g.from}}),
+    recipient_id: {_: 'peerUser', user_id: uid}, date: g.date, ...(g.message && {message: g.message})} : undefined;
+  const unique = mint(g.gift, uid, details), old = msgs.find((x) => x.id === g.msg_id);
+  g.gift = unique; g.canUpgrade = false;
+  const ups = [];
+  if(old?.action) { delete old.action.pFlags.can_upgrade; old.action.pFlags.upgraded = true; old.edit_date = now(); pts++;
+    ups.push({_: 'updateEditMessage', message: tlMessage(old), pts, pts_count: 1}); }
+  const m = addMessage(g.key || 'u' + g.from, SELF, '', now(), {action: {_: 'messageActionStarGiftUnique', pFlags: flags({upgrade: true, saved: !g.unsaved}), gift: unique,
+    can_transfer_at: now() - 1, can_resell_at: now() - 1}});
+  ups.push({_: 'updateNewMessage', message: tlMessage(m), pts, pts_count: 1}, {_: 'updateStarsBalance', balance: tlStars()});
+  return updatesOf(ups, old ? [old, m] : [m]);
+};
+
+/* resale marketplace: per gift, either what export_real.js captured or a generated list (owned by the simulated users) */
+const resalePools = new Map();
+function resalePool(giftId) {
+  const id = String(giftId);
+  if(resalePools.has(id)) return resalePools.get(id);
+  const gift = giftById(id), owners = [...users.keys()].filter((u) => u !== SELF);
+  const real = REAL?.resale?.[id]?.gifts;
+  const list = real?.length ? real.map((u, i) => ({...u, owner_id: {_: 'peerUser', user_id: owners[i % owners.length]}, resell_amount: u.resell_amount?.length ? u.resell_amount :
+    [{_: 'starsAmount', amount: String(200 + i * 75), nanos: 0}]})) :
+    Array.from({length: 12}, (_, i) => ({...mint(gift, owners[i % owners.length]), resell_amount: [{_: 'starsAmount', amount: String(100 + ((i * 137) % 900)), nanos: 0}]}));
+  resalePools.set(id, list);
+  return list;
+}
+const attrKey = (u, t) => u.attributes.find((a) => a._ === t);
+H['payments.getResaleStarGifts'] = (p) => {
+  const all = resalePool(p.gift_id);
+  let list = all.slice();
+  const want = (t, f) => (p.attributes || []).filter((x) => x._ === t).map(f);
+  const wm = want('starGiftAttributeIdModel', (x) => String(x.document_id)), wp = want('starGiftAttributeIdPattern', (x) => String(x.document_id)), wb = want('starGiftAttributeIdBackdrop', (x) => x.backdrop_id);
+  if(wm.length) list = list.filter((u) => wm.includes(String(attrKey(u, 'starGiftAttributeModel').document.id)));
+  if(wp.length) list = list.filter((u) => wp.includes(String(attrKey(u, 'starGiftAttributePattern').document.id)));
+  if(wb.length) list = list.filter((u) => wb.includes(attrKey(u, 'starGiftAttributeBackdrop').backdrop_id));
+  const price = (u) => +u.resell_amount[0].amount;
+  if(p.pFlags?.sort_by_price) list.sort((a, b) => price(a) - price(b)); else if(p.pFlags?.sort_by_num) list.sort((a, b) => a.num - b.num);
+  const from = +p.offset || 0, limit = p.limit || 50, page = list.slice(from, from + limit);
+  const res = {_: 'payments.resaleStarGifts', pFlags: {}, count: list.length, gifts: page, ...(from + limit < list.length && {next_offset: String(from + limit)}),
+    chats: [], users: usersOf(page.map((u) => u.owner_id.user_id))};
+  if(String(p.attributes_hash) !== '1') {
+    // filters list exactly the attributes that exist among this gift's listings (so every filter finds something)
+    const uniq = (arr, k) => [...new Map(arr.map((x) => [k(x), x])).values()];
+    const a = {models: uniq(all.map((u) => attrKey(u, 'starGiftAttributeModel')), (x) => String(x.document.id)),
+      patterns: uniq(all.map((u) => attrKey(u, 'starGiftAttributePattern')), (x) => String(x.document.id)),
+      backdrops: uniq(all.map((u) => attrKey(u, 'starGiftAttributeBackdrop')), (x) => x.backdrop_id)};
+    res.attributes = [...a.models, ...a.patterns, ...a.backdrops];
+    res.attributes_hash = '1';
+    const cnt = (test) => all.filter(test).length;
+    res.counters = [
+      ...a.models.map((m) => ({_: 'starGiftAttributeCounter', attribute: {_: 'starGiftAttributeIdModel', document_id: m.document.id}, count: cnt((u) => String(attrKey(u, 'starGiftAttributeModel').document.id) === String(m.document.id))})),
+      ...a.patterns.map((m) => ({_: 'starGiftAttributeCounter', attribute: {_: 'starGiftAttributeIdPattern', document_id: m.document.id}, count: cnt((u) => String(attrKey(u, 'starGiftAttributePattern').document.id) === String(m.document.id))})),
+      ...a.backdrops.map((b) => ({_: 'starGiftAttributeCounter', attribute: {_: 'starGiftAttributeIdBackdrop', backdrop_id: b.backdrop_id}, count: cnt((u) => attrKey(u, 'starGiftAttributeBackdrop').backdrop_id === b.backdrop_id)}))
+    ].filter((c) => c.count > 0);
+  }
+  return res;
+};
+
+H['payments.getUniqueStarGift'] = (p) => {
+  const hit = findSavedRec({_: 'inputSavedStarGiftSlug', slug: p.slug});
+  let gift = hit?.g.gift;
+  if(!gift) for(const list of resalePools.values()) { gift = list.find((u) => u.slug === p.slug); if(gift) break; }
+  if(!gift) throw fail(400, 'STARGIFT_SLUG_INVALID');
+  return {_: 'payments.uniqueStarGift', gift, chats: [], users: usersOf([gift.owner_id?.user_id].filter(Boolean))};
+};
+H['payments.getSavedStarGift'] = (p) => {
+  const found = (p.stargift || []).map(findSavedRec).filter(Boolean);
+  return {_: 'payments.savedStarGifts', pFlags: {}, count: found.length, gifts: found.map((r) => tlSavedGift(r.g)), chats: [],
+    users: usersOf(found.flatMap((r) => [r.g.from, r.uid]))};
+};
+H['payments.transferStarGift'] = (p) => {
+  const hit = findSavedRec(p.stargift), key = peerKeyOf(p.to_id);
+  if(!hit || !isUniqueGift(hit.g)) throw fail(400, 'STARGIFT_INVALID');
+  if(!key || key[0] !== 'u') throw fail(400, 'PEER_ID_INVALID');
+  const to = +key.slice(1), list = savedGifts.get(hit.uid);
+  list.splice(list.indexOf(hit.g), 1);
+  hit.g.gift.owner_id = {_: 'peerUser', user_id: to}; hit.g.pinned = false; hit.g.from = hit.uid;
+  if(!savedGifts.has(to)) savedGifts.set(to, []);
+  savedGifts.get(to).push(hit.g);
+  const m = addMessage(key, SELF, '', now(), {action: {_: 'messageActionStarGiftUnique', pFlags: flags({transferred: true, saved: true}), gift: hit.g.gift,
+    from_id: {_: 'peerUser', user_id: SELF}}});
+  return updatesOf([{_: 'updateNewMessage', message: tlMessage(m), pts, pts_count: 1}], [m]);
+};
+H['payments.updateStarGiftPrice'] = (p) => {
+  const hit = findSavedRec(p.stargift);
+  if(!hit || !isUniqueGift(hit.g)) throw fail(400, 'STARGIFT_INVALID');
+  if(+p.resell_amount?.amount > 0) hit.g.gift.resell_amount = [p.resell_amount]; else delete hit.g.gift.resell_amount;
+  return updatesOf([]);
+};
+
+/* ── sticker sets tweb asks for by built-in name (emoji status picker, generic animations, ...) ── */
+const LOCAL_SETS = ['inputStickerSetAnimatedEmoji', 'inputStickerSetAnimatedEmojiAnimations', 'inputStickerSetPremiumGifts', 'inputStickerSetEmojiGenericAnimations',
+  'inputStickerSetEmojiDefaultStatuses', 'inputStickerSetEmojiDefaultTopicIcons', 'inputStickerSetEmojiChannelDefaultStatuses', 'inputStickerSetTonGifts'];
+H['messages.getStickerSet'] = (p) => {
+  const kind = p.stickerset?._, idx = LOCAL_SETS.indexOf(kind);
+  if(idx < 0) throw fail(400, 'STICKERSET_INVALID');
+  const documents = kind === 'inputStickerSetEmojiDefaultStatuses' ?
+    (REAL?.defaultStatuses || []).map((st) => docsById.get(String(st.document_id))).filter(Boolean) : [];
+  return {_: 'messages.stickerSet', set: {_: 'stickerSet', pFlags: flags({emojis: /Emoji|Statuses/.test(kind)}), id: String(8000000 + idx), access_hash: '1',
+    title: kind.replace('inputStickerSet', ''), short_name: kind.replace('inputStickerSet', ''), count: documents.length, hash: 0}, packs: [], keywords: [], documents};
+};
+
+/* ── premium as a gift (the options list the gift dialog needs: 3/6/12 months, in money and in Stars) ── */
+H['payments.getPremiumGiftCodeOptions'] = () => [[3, 1500, 1000], [6, 2500, 1700], [12, 4500, 3000]].flatMap(([months, usd, stars]) => [
+  {_: 'premiumGiftCodeOption', pFlags: {}, users: 1, months, currency: 'USD', amount: String(usd)},
+  {_: 'premiumGiftCodeOption', pFlags: {}, users: 1, months, currency: 'XTR', amount: String(stars)}]);
 
 /* ── methods that were showing up as "unhandled" ── */
 H['stories.getAllReadPeerStories'] = () => updatesOf([]);
@@ -617,6 +866,26 @@ app.get('/debug/stars', (req, res) => {
   res.json({stars: acct.stars});
 });
 // /debug/gift?gift=5001&from=1001&text=hi  -> a fake contact sends YOU a gift
+// /debug/seed?n=8&unique=3&to=1000,1001   -> fills profiles with regular + collectible gifts (no chat messages) so the Gifts tab has something to show
+let seedId = 900000;
+app.get('/debug/seed', (req, res) => {
+  const targets = (req.query.to || '1000,1001,1002,1003').split(',').map(Number), n = +req.query.n || 6;
+  const senders = [...users.keys()].filter((i) => i !== SELF);
+  for(const uid of targets) {
+    if(!savedGifts.has(uid)) savedGifts.set(uid, []);
+    for(let i = 0; i < n; i++) {
+      const gift = CATALOG[(i + uid) % CATALOG.length];
+      savedGifts.get(uid).push({msg_id: ++seedId, from: senders.find((x) => x !== uid) ?? SELF, date: now() - i * 3600, gift, unsaved: false, canUpgrade: uid === SELF && !!gift.upgrade_stars,
+        message: i % 3 === 0 ? {_: 'textWithEntities', text: 'Enjoy! #' + (i + 1), entities: []} : undefined});
+    }
+    for(let i = 0; i < (+req.query.unique || 0); i++) {
+      const gift = CATALOG[(i + uid + 1) % CATALOG.length];
+      savedGifts.get(uid).push({msg_id: ++seedId, from: senders.find((x) => x !== uid) ?? SELF, date: now() - (i + n) * 3600, gift: mint(gift, uid), unsaved: false});
+    }
+    push(updatesOf([{_: 'updateUser', user_id: uid}]));
+  }
+  res.json({ok: true, to: targets, each: n, unique: +req.query.unique || 0});
+});
 app.get('/debug/gift', (req, res) => {
   const gift = giftById(req.query.gift || CATALOG[0].id), from = +req.query.from || 1001;
   if(!gift) return res.status(400).json({error: 'unknown gift', ids: CATALOG.map((g) => g.id)});

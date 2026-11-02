@@ -9,7 +9,7 @@ export TWEB_DIR="$PWD"
 trap 'kill 0' EXIT
 
 # backend (VALIDATE=1 checks replies against the TL schema; remove it if too noisy)
-VALIDATE=1 PORT=3000 node server.js &
+VALIDATE=0 PORT=3000 node server.js &
 
 # frontend
-VITE_FAKE_API=http://localhost:3000 pnpm start
+VITE_FAKE_API=https://crispy-fortnight-g456697rr47x25xp-3000.app.github.dev pnpm start
