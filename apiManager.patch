@@ -1,0 +1,104 @@
+diff --git a/src/lib/appManagers/apiManager.ts b/src/lib/appManagers/apiManager.ts
+index 573f300..7c3fac4 100644
+--- a/src/lib/appManagers/apiManager.ts
++++ b/src/lib/appManagers/apiManager.ts
+@@ -50,6 +50,33 @@ const PREMIUM_FILE_NETWORKERS_COUNT = 6;
+ const REGULAR_FILE_NETWORKERS_COUNT = 3;
+ const DESTROY_NETWORKERS = true;
+ 
++// * SIMULATED BACKEND: when VITE_FAKE_API is set (e.g. http://localhost:3000) every request goes to that
++// * server as plain JSON instead of MTProto, and updates arrive over its /updates WebSocket
++const FAKE_API_URL: string = (import.meta as any).env?.VITE_FAKE_API || '';
++const FAKE_JSON = {
++  replacer(_key: string, value: any) {
++    if(value instanceof Uint8Array) return {__b64: bytesToB64(value)};
++    if(value instanceof ArrayBuffer) return {__b64: bytesToB64(new Uint8Array(value))};
++    if(typeof(value) === 'bigint') return value.toString();
++    return value;
++  },
++  reviver(_key: string, value: any) {
++    if(value && typeof(value) === 'object' && typeof(value.__b64) === 'string') return b64ToBytes(value.__b64);
++    return value;
++  }
++};
++function bytesToB64(bytes: Uint8Array) {
++  let s = '';
++  for(let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000) as any);
++  return btoa(s);
++}
++function b64ToBytes(b64: string) {
++  const bin = atob(b64);
++  const out = new Uint8Array(bin.length);
++  for(let i = 0; i < bin.length; ++i) out[i] = bin.charCodeAt(i);
++  return out;
++}
++
+ export class ApiManager extends ApiManagerMethods {
+   private static fillTimeManagerOffsetPromise: Promise<void>;
+ 
+@@ -570,6 +597,7 @@ export class ApiManager extends ApiManagerMethods {
+   }
+ 
+   public getNetworkerVoid(dcId: DcId) {
++    if(FAKE_API_URL) return Promise.resolve();
+     return this.getNetworker(dcId).then(noop, noop);
+   }
+ 
+@@ -673,7 +701,57 @@ export class ApiManager extends ApiManagerMethods {
+     this.networkerFactory.setUpdatesProcessor(callback);
+   }
+ 
++  private fakeSocket: WebSocket;
++  private fakeSocketAttempt = 0;
++
++  private connectFakeUpdates() {
++    if(this.fakeSocket || !FAKE_API_URL) return;
++    const url = FAKE_API_URL.replace(/^http/, 'ws') + '/updates';
++    const socket = this.fakeSocket = new WebSocket(url);
++    socket.onopen = () => {
++      this.fakeSocketAttempt = 0;
++    };
++    socket.onmessage = (event) => {
++      try {
++        const update = JSON.parse(event.data as string, FAKE_JSON.reviver);
++        this.networkerFactory.updatesProcessor?.(update);
++      } catch(err) {
++        this.log.error('fake update error', err);
++      }
++    };
++    socket.onclose = () => {
++      this.fakeSocket = undefined;
++      setTimeout(() => this.connectFakeUpdates(), Math.min(10000, 500 * ++this.fakeSocketAttempt));
++    };
++  }
++
++  private invokeFake(method: string, params: any, options: InvokeApiOptions): CancellablePromise<any> {
++    const deferred = deferredPromise<any>();
++    this.connectFakeUpdates();
++    fetch(FAKE_API_URL + '/api', {
++      method: 'POST',
++      headers: {'Content-Type': 'application/json'},
++      body: JSON.stringify({method, params, account: this.getAccountNumber()}, FAKE_JSON.replacer)
++    }).then((response) => response.text()).then((text) => {
++      const json = JSON.parse(text, FAKE_JSON.reviver);
++      if(json.error) {
++        const error = makeError(json.error.type, json.error.message);
++        error.code = json.error.code || 400;
++        error.type = json.error.type;
++        if(!options.noErrorBox) error.handled = true;
++        deferred.reject(error);
++      } else {
++        deferred.resolve(json.result);
++      }
++    }).catch((err) => {
++      deferred.reject(makeError('NETWORK_ERROR' as any, String(err)));
++    });
++    return deferred;
++  }
++
+   public invokeApi<T extends keyof MethodDeclMap>(method: T, params: MethodDeclMap[T]['req'] = {}, options: InvokeApiOptions = {}): CancellablePromise<MethodDeclMap[T]['res']> {
++    if(FAKE_API_URL) return this.invokeFake(method, params, options) as any;
++
+     // /////this.log('Invoke api', method, params, options);
+ 
+     /* if(!this.lol) {

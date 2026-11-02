@@ -125,7 +125,7 @@
     "vite-plugin-handlebars": "^2.0.3",
     "vite-plugin-solid": "^2.11.13",
     "vitest": "^4.1.12",
-    "ws": "^8.21.1"
+    "ws": "^8.22.1"
   },
   "packageManager": "pnpm@11.16.0"
 }

@@ -254,8 +254,8 @@ importers:
         specifier: ^4.1.12
         version: 4.1.12(@types/node@26.1.1)(jsdom@29.1.1)(vite@8.3.4(@types/node@26.1.1)(esbuild@0.28.2)(sass@1.101.3))
       ws:
-        specifier: ^8.21.1
-        version: 8.21.1
+        specifier: ^8.22.1
+        version: 8.22.1
 
 packages:
 
@@ -3715,8 +3715,8 @@ packages:
   wrappy@1.0.2:
     resolution: {integrity: sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ==}
 
-  ws@8.21.1:
-    resolution: {integrity: sha512-+0NTnW77fFN/DjQi6k/Sq/Yvk4Sgajw7urW8V+asjXnRgDs9gyGkdb7EzgfhA4goXsRIZKE28fzIXBHEzhuiWw==}
+  ws@8.22.1:
+    resolution: {integrity: sha512-oyL6OPYme/CmiFvNuGzeoxCJ4nOrZE2O1FwM9MWM1AsGri6nLXB2pg+lNA8aLeXMSav0J6eIVS1j6vUPzUtK9g==}
     engines: {node: '>=10.0.0'}
     peerDependencies:
       bufferutil: ^4.0.1
@@ -7057,7 +7057,7 @@ snapshots:
 
   wrappy@1.0.2: {}
 
-  ws@8.21.1: {}
+  ws@8.22.1: {}
 
   wsl-utils@0.3.1:
     dependencies:
