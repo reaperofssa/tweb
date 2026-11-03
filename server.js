@@ -452,7 +452,8 @@ const withResale = (g) => {
   if(!pool.length) return g;
   return {...g, availability_resale: String(pool.length), resell_min_stars: String(Math.min(...pool.map((u) => +u.resell_amount[0].amount)))};
 };
-H['payments.getStarGifts'] = (p) => (p.hash === 1 ? {_: 'payments.starGiftsNotModified'} : {_: 'payments.starGifts', hash: 1, gifts: CATALOG.map(withResale), chats: [], users: []});
+let shopHash = 1;
+H['payments.getStarGifts'] = (p) => (p.hash === shopHash ? {_: 'payments.starGiftsNotModified'} : {_: 'payments.starGifts', hash: shopHash, gifts: CATALOG.map(withResale), chats: [], users: []});
 H['payments.getStarGiftCollections'] = () => ({_: 'payments.starGiftCollections', collections: []});
 H['payments.checkCanSendGift'] = () => ({_: 'payments.checkCanSendGiftResultOk'});
 
@@ -499,6 +500,7 @@ H['payments.toggleStarGiftsPinnedToTop'] = (p) => {
 const forms = new Map();
 H['payments.getPaymentForm'] = (p) => {
   const inv = p.invoice;
+  if(inv?._ === 'inputInvoiceStarGiftResale') return resaleForm(inv);
   if(inv?._ !== 'inputInvoiceStarGift') throw fail(400, 'INVOICE_INVALID');
   const gift = giftById(inv.gift_id);
   if(!gift) throw fail(400, 'GIFT_INVALID'); // tweb shows "STARGIFT_INVALID"-style errors for this
@@ -509,7 +511,9 @@ H['payments.getPaymentForm'] = (p) => {
       ...(inv.pFlags?.include_upgrade && gift.upgrade_stars ? [{_: 'labeledPrice', label: 'Upgrade', amount: gift.upgrade_stars}] : [])]}};
 };
 H['payments.sendStarsForm'] = (p) => {
-  const inv = forms.get(String(p.form_id)) || p.invoice, gift = giftById(inv?.gift_id);
+  const inv = forms.get(String(p.form_id)) || p.invoice;
+  if(inv?._ === 'inputInvoiceStarGiftResale') return buyResale(p, inv);
+  const gift = giftById(inv?.gift_id);
   if(!gift) throw fail(400, 'FORM_EXPIRED');
   const prepaid = !!(inv.pFlags?.include_upgrade && gift.upgrade_stars), cost = +gift.stars + (prepaid ? +gift.upgrade_stars : 0);
   if(acct.stars < cost) throw fail(400, 'BALANCE_TOO_LOW');
@@ -727,6 +731,52 @@ H['payments.updateStarGiftPrice'] = (p) => {
   return updatesOf([]);
 };
 
+/* ── buying a collectible from the resale market + its value info ── */
+function findListing(slug) {
+  for(const list of resalePools.values()) { const i = list.findIndex((u) => u.slug === slug); if(i >= 0) return {list, i, gift: list[i]}; }
+}
+function resaleForm(inv) {
+  const hit = findListing(inv.slug);
+  if(!hit) throw fail(400, 'STARGIFT_SLUG_INVALID');
+  const id = String(Date.now() + forms.size);
+  forms.set(id, inv);
+  return {_: 'payments.paymentFormStarGift', form_id: id, invoice: {_: 'invoice', pFlags: {}, currency: 'XTR',
+    prices: [{_: 'labeledPrice', label: hit.gift.title + ' #' + hit.gift.num, amount: hit.gift.resell_amount[0].amount}]}};
+}
+function buyResale(p, inv) {
+  const hit = findListing(inv.slug);
+  if(!hit) throw fail(400, 'FORM_EXPIRED');
+  const price = +hit.gift.resell_amount[0].amount, key = peerKeyOf(inv.to_id);
+  if(!key || key[0] !== 'u') throw fail(400, 'PEER_ID_INVALID');
+  if(acct.stars < price) throw fail(400, 'BALANCE_TOO_LOW');
+  const buyer = +key.slice(1), seller = hit.gift.owner_id.user_id;
+  acct.stars -= price;
+  hit.list.splice(hit.i, 1);
+  shopHash++;
+  const unique = {...hit.gift, owner_id: {_: 'peerUser', user_id: buyer}};
+  delete unique.resell_amount;
+  const hidden = !inv.pFlags?.show_name;
+  // bought for yourself: the message comes from the seller; bought as a present: it is yours, sent to the recipient
+  const chatKey = buyer === SELF ? 'u' + seller : key, sender = buyer === SELF ? seller : SELF;
+  const m = addMessage(chatKey, sender, '', now(), {action: {_: 'messageActionStarGiftUnique', pFlags: flags({saved: true, name_hidden: hidden}), gift: unique,
+    from_id: {_: 'peerUser', user_id: sender}, resale_amount: {_: 'starsAmount', amount: String(price), nanos: 0}, can_transfer_at: now() - 1, can_resell_at: now() - 1,
+    ...(inv.message && {message: inv.message})}});
+  if(!savedGifts.has(buyer)) savedGifts.set(buyer, []);
+  savedGifts.get(buyer).push({msg_id: m.id, from: sender, date: m.date, gift: unique, message: inv.message, unsaved: false, nameHidden: hidden, key: chatKey});
+  forms.delete(String(p.form_id));
+  return {_: 'payments.paymentResult', updates: updatesOf([{_: 'updateNewMessage', message: tlMessage(m), pts, pts_count: 1},
+    {_: 'updateStarsBalance', balance: tlStars()}], [m])};
+}
+H['payments.getUniqueStarGiftValueInfo'] = (p) => {
+  const gift = findSavedRec({_: 'inputSavedStarGiftSlug', slug: p.slug})?.g.gift || findListing(p.slug)?.gift;
+  if(!gift) throw fail(400, 'STARGIFT_SLUG_INVALID');
+  const base = giftById(gift.gift_id), prices = resalePool(gift.gift_id).map((u) => +u.resell_amount[0].amount);
+  const floor = prices.length ? Math.min(...prices) : +(base?.stars || 100), avg = prices.length ? Math.round(prices.reduce((a, b) => a + b, 0) / prices.length) : floor;
+  const usd = (stars) => String(Math.round(stars * 1.3)); // US cents, ~1.3 cents per Star
+  return {_: 'payments.uniqueStarGiftValueInfo', pFlags: {}, currency: 'USD', value: usd(avg * 1.2), initial_sale_date: now() - 86400 * 30,
+    initial_sale_stars: String(base?.stars || 100), initial_sale_price: usd(+(base?.stars || 100)), floor_price: usd(floor), average_price: usd(avg), listed_count: prices.length};
+};
+
 /* ── sticker sets tweb asks for by built-in name (emoji status picker, generic animations, ...) ── */
 const LOCAL_SETS = ['inputStickerSetAnimatedEmoji', 'inputStickerSetAnimatedEmojiAnimations', 'inputStickerSetPremiumGifts', 'inputStickerSetEmojiGenericAnimations',
   'inputStickerSetEmojiDefaultStatuses', 'inputStickerSetEmojiDefaultTopicIcons', 'inputStickerSetEmojiChannelDefaultStatuses', 'inputStickerSetTonGifts'];
@@ -914,4 +964,4 @@ addMessage('c2001', 1001, 'Hi all', t + 2460);
 addMessage('u1000', SELF, 'Saved note', t + 3000);
 readState['u1001'] = {inbox: lastId - 6 + 1, outbox: 0}; // first message read, last one unread
 
-server.listen(PORT, () => log(`simulated backend on http://localhost:${PORT}  (login code ${LOGIN_CODE})`));
+server.listen(PORT, () => log('build 82: resale purchase + value info') || log(`simulated backend on http://localhost:${PORT}  (login code ${LOGIN_CODE})`));
