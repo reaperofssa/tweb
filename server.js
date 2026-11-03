@@ -18,6 +18,8 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const express = require('express');
+let compression = null;
+try { compression = require('compression'); } catch(_) { /* optional: npm i compression */ }
 const {WebSocketServer} = require('ws');
 const WA = require('./wa-auth'); // real WhatsApp login (Baileys)
 const createBridge = require('./wa-bridge'); // WhatsApp chats <-> this store
@@ -27,6 +29,7 @@ const TWEB_DIR = process.env.TWEB_DIR || path.join(__dirname, 'tweb');
 const SELF = 1000;
 const acct = {premium: process.env.PREMIUM !== '0', stars: +process.env.STARS || 5000}; // PREMIUM=0 to start as a free user
 const now = () => Math.floor(Date.now() / 1000);
+const LOG_REQ = process.env.LOG_REQ === '1'; // set LOG_REQ=1 to log every API call
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
 /* ───────────────────────────── TL schema (for fallbacks) ───────────────────────────── */
@@ -949,16 +952,19 @@ app.use((req, res, next) => {
   res.set({'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type', 'Access-Control-Allow-Methods': 'POST, GET, OPTIONS'});
   req.method === 'OPTIONS' ? res.sendStatus(204) : next();
 });
+if(compression) app.use(compression({threshold: 1024}));
 app.use(express.json({limit: '100mb', reviver: jsonReviver}));
 
-const GATED = /^(messages|contacts|users|updates)\./;
+// Only calls whose answer depends on WhatsApp's history (message ids are numbered once, when history finishes) wait.
+// Everything else (auth check users.*, updates.getState, reactions, stickers, filters, config...) answers instantly so the UI shell shows up right away.
+const GATED = /^(messages\.(getDialogs|getPeerDialogs|getHistory|getMessages|getReplies|search|searchGlobal|getSearchCounters|getUnreadMentions|getUnreadReactions|getRecentLocations)|contacts\.(getContacts|search))$/;
 app.post('/api', async(req, res) => {
   const {method, params = {}} = req.body || {};
   try {
     if(GATED.test(method) && !bridge.isReady()) await bridge.whenReady(); // first link: wait for WhatsApp's history
     const result = H[method] ? await H[method](params) : fallback(method);
     if(process.env.VALIDATE) checkResult(method, result);
-    log(`${H[method] ? '·' : '~'} ${method}`);
+    if(LOG_REQ) log(`${H[method] ? '·' : '~'} ${method}`);
     res.type('json').send(JSON.stringify({result}, jsonReplacer));
   } catch(e) {
     log(`! ${method} -> ${e.type || e.message}`);
