@@ -91,12 +91,48 @@ module.exports = function createBridge(ctx) {
     const pn = norm(pnRaw);
     if(!isPn(pn) || reg.lidToPn[lid] === pn) return;
     reg.lidToPn[lid] = pn;
-    // a chat/user that was created under the LID keeps its id, and now answers to the phone JID too
-    if(reg.byJid[lid] && !reg.byJid[pn]) {
-      const id = reg.byJid[lid];
-      reg.byJid[pn] = id;
-      reg.jidById[id] = pn;
+    // one person = one id: whatever was created under the LID (user, chat, messages) moves to the phone id
+    const lidId = reg.byJid[lid];
+    if(lidId) {
+      const pnId = idOf(pn);
+      if(pnId !== lidId) migrate(lidId, pnId, pn);
+      delete reg.byJid[lid];
+      delete reg.jidById[lidId];
     }
+    const [phone] = pn.split('@'), u = users.get(idOf(pn));
+    if(u) {
+      if(!u.phone) u.phone = phone;
+      if(u.first_name === 'WhatsApp user') u.first_name = '+' + phone;
+    }
+  }
+
+  /** moves everything of a duplicate user id (chat key, messages, group membership, read state, profile) onto the canonical one */
+  function migrate(fromId, toId, toJid) {
+    if(fromId === toId || fromId === SELF) return;
+    const fk = 'u' + fromId, tk = 'u' + toId;
+    for(const m of msgs) {
+      if(m.key === fk) {
+        m.key = tk;
+        if(m.waId && m.jid && toJid) { byWaId.delete(waKeyOf(m.jid, m.waId)); m.jid = toJid; byWaId.set(waKeyOf(m.jid, m.waId), m); }
+      }
+      if(m.from === fromId) m.from = toId;
+    }
+    for(const g of groups.values()) if(g.members.includes(fromId)) g.members = [...new Set(g.members.map((x) => (x === fromId ? toId : x)))];
+    const a = readState[fk], b = readState[tk];
+    if(a) { readState[tk] = {inbox: Math.max(a.inbox, b?.inbox || 0), outbox: Math.max(a.outbox, b?.outbox || 0)}; delete readState[fk]; }
+    if(chatUnread[fk] != null) { chatUnread[tk] = Math.max(chatUnread[fk], chatUnread[tk] || 0); delete chatUnread[fk]; }
+    const ua = users.get(fromId), ub = users.get(toId);
+    if(ua) {
+      if(!ub) users.set(toId, ua);
+      else {
+        if((ua.rank ?? -1) > (ub.rank ?? -1)) { ub.first_name = ua.first_name; ub.last_name = ua.last_name; ub.rank = ua.rank; }
+        ub.contact = ub.contact || ua.contact;
+      }
+      users.delete(fromId);
+    }
+    delete reg.jidById[fromId];
+    touch();
+    log(`merged duplicate id ${fromId} -> ${toId}`);
   }
 
   const kindOf = (jid) => (serverOf(jid) === 'g.us' ? 'group' : (isPn(jid) || isLid(jid)) ? 'user' : null);
@@ -185,13 +221,18 @@ module.exports = function createBridge(ctx) {
     if(!meta?.id) return;
     const id = ensureGroup(meta.id, meta.subject);
     const g = groups.get(id), members = new Set([SELF]);
+    g.announce = !!meta.announce;
+    g.selfAdmin = false;
     for(const p of meta.participants || []) {
       let jid = p.id;
       if(isLid(jid) && p.phoneNumber) { learn(jid, p.phoneNumber); jid = p.phoneNumber; }
       else if(isPn(jid) && p.lid) learn(p.lid, jid);
-      members.add(ensureUser(jid, p.name || p.notify, NAME_RANK.notify));
+      const uid = ensureUser(jid, p.name || p.notify, NAME_RANK.notify);
+      members.add(uid);
+      if(uid === SELF && p.admin) g.selfAdmin = true;
     }
     g.members = [...members];
+    if(ready) push({_: 'updates', updates: [{_: 'updateChat', chat_id: id}], users: [], chats: [tlChat(id)], date: now(), seq: 0});
   }
 
   async function refreshGroups() {
@@ -502,7 +543,17 @@ module.exports = function createBridge(ctx) {
     safe('chats.update', (l) => { onChatsUpdate(l); dirty(); });
     safe('lid-mapping.update', ({lid, pn}) => learn(lid, pn));
     safe('groups.upsert', (l) => { l.forEach(upsertGroupMeta); dirty(); });
-    safe('groups.update', (l) => { l.forEach((g) => g.id && g.subject && ensureGroup(g.id, g.subject)); dirty(); });
+    safe('groups.update', (l) => {
+      for(const meta of l) {
+        if(!meta.id) continue;
+        const id = ensureGroup(meta.id, meta.subject), g = groups.get(id);
+        if(typeof meta.announce === 'boolean' && g.announce !== meta.announce) {
+          g.announce = meta.announce;
+          if(ready) push({_: 'updates', updates: [{_: 'updateChat', chat_id: id}], users: [], chats: [tlChat(id)], date: now(), seq: 0});
+        }
+      }
+      dirty();
+    });
     safe('group-participants.update', ({id, participants, action}) => {
       const cid = ensureGroup(id);
       for(const p of participants || []) {
@@ -568,6 +619,10 @@ module.exports = function createBridge(ctx) {
       msgs.push(...(s.msgs || []));
       Object.assign(readState, s.readState || {});
       for(const m of msgs) if(m.waId && m.jid) byWaId.set(waKeyOf(m.jid, m.waId), m);
+      for(const [jid, id] of Object.entries(reg.byJid)) { // old stores aliased phone JIDs to registry ids: fold them back onto Number(phone)
+        const [user, server] = jid.split('@');
+        if(server === 's.whatsapp.net' && /^\d{7,15}$/.test(user) && id !== Number(user)) { migrate(id, Number(user), jid); delete reg.byJid[jid]; delete reg.jidById[id]; }
+      }
       setLastId(s.lastId || msgs.reduce((n, m) => Math.max(n, m.id), 0));
       setPts(Math.max(getPts(), s.pts || 0));
       touch();
@@ -700,3 +755,4 @@ module.exports = function createBridge(ctx) {
   return {attach, onOpen, whenReady, isReady: () => ready, active, send, edit, del, markRead, setTyping, setOnline, openChat,
     getMessage: async(key) => findMsg(key)?.wa?.message, byId: (id) => msgs.find((m) => m.id === id)};
 };
+ 

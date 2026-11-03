@@ -129,8 +129,15 @@ const tlUser = (id) => {
     first_name: u.first_name, last_name: u.last_name || '', ...(u.username && {username: u.username}), ...(u.emoji_status && {emoji_status: u.emoji_status}), phone: u.phone,
     status: u.status || {_: 'userStatusRecently', pFlags: {}}};
 };
-const tlChat = (id) => ({_: 'chat', pFlags: {}, id, title: groups.get(id).title, photo: {_: 'chatPhotoEmpty'},
-  participants_count: groups.get(id).members.length, date: now(), version: 1});
+// tweb's hasRights() answers false for a chat with no default_banned_rights/admin_rights => "Sending messages is not allowed in this group".
+// WhatsApp "only admins can send" groups (g.announce) ban sending for everybody except admins (g.selfAdmin).
+const SEND_BANS = ['send_messages', 'send_plain', 'send_media', 'send_photos', 'send_videos', 'send_roundvideos', 'send_audios',
+  'send_voices', 'send_docs', 'send_stickers', 'send_gifs', 'send_games', 'send_inline', 'embed_links', 'send_polls'];
+const tlChat = (id) => {
+  const g = groups.get(id), muted = !!(g.announce && !g.selfAdmin);
+  return {_: 'chat', pFlags: {}, id, title: g.title, photo: {_: 'chatPhotoEmpty'}, participants_count: g.members.length, date: now(), version: 1,
+    default_banned_rights: {_: 'chatBannedRights', pFlags: muted ? Object.fromEntries(SEND_BANS.map((k) => [k, true])) : {}, until_date: 0}};
+};
 const tlService = (m) => ({_: 'messageService', pFlags: flags({out: m.out}), id: m.id, from_id: {_: 'peerUser', user_id: m.from},
   peer_id: peerOf(m.key), date: m.date, action: m.action});
 const tlMessage = (m) => m.action ? tlService(m) : ({_: 'message', pFlags: flags({out: m.out}), id: m.id, from_id: {_: 'peerUser', user_id: m.from},
