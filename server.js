@@ -140,8 +140,14 @@ const tlChat = (id) => {
 };
 const tlService = (m) => ({_: 'messageService', pFlags: flags({out: m.out}), id: m.id, from_id: {_: 'peerUser', user_id: m.from},
   peer_id: peerOf(m.key), date: m.date, action: m.action});
+// WhatsApp tags ("@<number>") are turned into tweb mention entities by the bridge at render time, so the shown name is always current
+let renderMentions = null;
+const msgBody = (m) => {
+  const r = m.mentions?.length && renderMentions ? renderMentions(m) : null;
+  return r ? {message: r.text, ...(r.entities.length && {entities: r.entities})} : {message: m.text};
+};
 const tlMessage = (m) => m.action ? tlService(m) : ({_: 'message', pFlags: flags({out: m.out}), id: m.id, from_id: {_: 'peerUser', user_id: m.from},
-  peer_id: peerOf(m.key), date: m.date, message: m.text, ...(m.edit_date && {edit_date: m.edit_date}),
+  peer_id: peerOf(m.key), date: m.date, ...msgBody(m), ...(m.edit_date && {edit_date: m.edit_date}),
   ...(m.reply_to && {reply_to: {_: 'messageReplyHeader', pFlags: {}, reply_to_msg_id: m.reply_to}})});
 const tlDialog = (key) => {
   const list = msgsOf(key), top = list[list.length - 1], rs = readState[key] || (readState[key] = {inbox: 0, outbox: 0});
@@ -184,6 +190,7 @@ function pushIncoming(key, from, text) {
 const fail = (code, type, message) => Object.assign(new Error(type), {code, type, message});
 const bridge = createBridge({users, groups, msgs, readState, SELF, push, updatesOf, tlMessage, tlChat, tlUser, addMessage, touch, WA, fail, now, log,
   getLastId: () => lastId, setLastId: (n) => { lastId = n; }, getPts: () => pts, setPts: (n) => { pts = n; }, bumpPts: () => ++pts});
+renderMentions = bridge.render;
 const H = {};
 
 // -- bootstrap / config
@@ -318,7 +325,7 @@ H['messages.sendMessage'] = async(p) => {
 H['messages.editMessage'] = async(p) => {
   const m = msgs.find((x) => x.id === p.id);
   if(!m) throw fail(400, 'MESSAGE_ID_INVALID');
-  if(bridge.active() && m.wa) await bridge.edit(m, p.message ?? m.text);
+  if(bridge.active() && m.wa) await bridge.edit(m, p.message ?? m.text, p.entities);
   else { m.text = p.message ?? m.text; m.edit_date = now(); pts++; }
   return updatesOf([{_: 'updateEditMessage', message: tlMessage(m), pts, pts_count: 1}], [m]);
 };

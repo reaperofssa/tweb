@@ -1,0 +1,204 @@
+diff --git a/server.js b/server.js
+index 84c8bfe..47a3a1e 100644
+--- a/server.js
++++ b/server.js
+@@ -140,8 +140,14 @@ const tlChat = (id) => {
+ };
+ const tlService = (m) => ({_: 'messageService', pFlags: flags({out: m.out}), id: m.id, from_id: {_: 'peerUser', user_id: m.from},
+   peer_id: peerOf(m.key), date: m.date, action: m.action});
++// WhatsApp tags ("@<number>") are turned into tweb mention entities by the bridge at render time, so the shown name is always current
++let renderMentions = null;
++const msgBody = (m) => {
++  const r = m.mentions?.length && renderMentions ? renderMentions(m) : null;
++  return r ? {message: r.text, ...(r.entities.length && {entities: r.entities})} : {message: m.text};
++};
+ const tlMessage = (m) => m.action ? tlService(m) : ({_: 'message', pFlags: flags({out: m.out}), id: m.id, from_id: {_: 'peerUser', user_id: m.from},
+-  peer_id: peerOf(m.key), date: m.date, message: m.text, ...(m.edit_date && {edit_date: m.edit_date}),
++  peer_id: peerOf(m.key), date: m.date, ...msgBody(m), ...(m.edit_date && {edit_date: m.edit_date}),
+   ...(m.reply_to && {reply_to: {_: 'messageReplyHeader', pFlags: {}, reply_to_msg_id: m.reply_to}})});
+ const tlDialog = (key) => {
+   const list = msgsOf(key), top = list[list.length - 1], rs = readState[key] || (readState[key] = {inbox: 0, outbox: 0});
+@@ -184,6 +190,7 @@ function pushIncoming(key, from, text) {
+ const fail = (code, type, message) => Object.assign(new Error(type), {code, type, message});
+ const bridge = createBridge({users, groups, msgs, readState, SELF, push, updatesOf, tlMessage, tlChat, tlUser, addMessage, touch, WA, fail, now, log,
+   getLastId: () => lastId, setLastId: (n) => { lastId = n; }, getPts: () => pts, setPts: (n) => { pts = n; }, bumpPts: () => ++pts});
++renderMentions = bridge.render;
+ const H = {};
+ 
+ // -- bootstrap / config
+@@ -318,7 +325,7 @@ H['messages.sendMessage'] = async(p) => {
+ H['messages.editMessage'] = async(p) => {
+   const m = msgs.find((x) => x.id === p.id);
+   if(!m) throw fail(400, 'MESSAGE_ID_INVALID');
+-  if(bridge.active() && m.wa) await bridge.edit(m, p.message ?? m.text);
++  if(bridge.active() && m.wa) await bridge.edit(m, p.message ?? m.text, p.entities);
+   else { m.text = p.message ?? m.text; m.edit_date = now(); pts++; }
+   return updatesOf([{_: 'updateEditMessage', message: tlMessage(m), pts, pts_count: 1}], [m]);
+ };
+diff --git a/wa-bridge.js b/wa-bridge.js
+index efa210d..f535d7e 100644
+--- a/wa-bridge.js
++++ b/wa-bridge.js
+@@ -116,6 +116,7 @@ module.exports = function createBridge(ctx) {
+         if(m.waId && m.jid && toJid) { byWaId.delete(waKeyOf(m.jid, m.waId)); m.jid = toJid; byWaId.set(waKeyOf(m.jid, m.waId), m); }
+       }
+       if(m.from === fromId) m.from = toId;
++      if(m.mentions) for(const x of m.mentions) if(x.id === fromId) x.id = toId;
+     }
+     for(const g of groups.values()) if(g.members.includes(fromId)) g.members = [...new Set(g.members.map((x) => (x === fromId ? toId : x)))];
+     const a = readState[fk], b = readState[tk];
+@@ -288,6 +289,50 @@ module.exports = function createBridge(ctx) {
+     return Number(t) || now();
+   };
+ 
++  /* ───────────────────────────── mentions (tags) ───────────────────────────── */
++
++  const userPart = (jid) => String(jid).split('@')[0].split(':')[0];
++
++  /**
++   * WhatsApp writes a tag as "@<number>" in the text and lists the tagged JIDs in contextInfo.mentionedJid.
++   * We keep {tag: <number as written in the text>, id: <tweb user id>} pairs on the message.
++   */
++  function mentionPairs(jids) {
++    const out = [];
++    for(const raw of jids || []) {
++      if(typeof raw !== 'string' || !raw.includes('@')) continue;
++      const jid = norm(raw);
++      if(kindOf(jid) !== 'user') continue;
++      out.push({tag: userPart(raw), id: ensureUser(jid, null)});
++    }
++    return out.length ? out : undefined;
++  }
++
++  const mentionsOf = (message) => mentionPairs(contextOf(message)?.mentionedJid);
++
++  function displayName(id) {
++    const u = users.get(id);
++    const name = u && [u.first_name, u.last_name].filter(Boolean).join(' ');
++    return name || (u?.phone ? '+' + u.phone : 'user');
++  }
++
++  /** text + tweb entities for a message with tags: "@1234567" -> "@Name" covered by a clickable messageEntityMentionName */
++  function render(m) {
++    const text = m.text || '', byTag = new Map(m.mentions.map((x) => [x.tag, x.id]));
++    const entities = [];
++    let out = '', last = 0;
++    for(const hit of text.matchAll(/@(\d+)/g)) {
++      const id = byTag.get(hit[1]);
++      if(id == null) continue;
++      const name = '@' + displayName(id);
++      out += text.slice(last, hit.index);
++      entities.push({_: 'messageEntityMentionName', offset: out.length, length: name.length, user_id: id});
++      out += name;
++      last = hit.index + hit[0].length;
++    }
++    return {text: out + text.slice(last), entities};
++  }
++
+   /** the chat a message key belongs to (phone JID when WhatsApp gives both) */
+   function chatJidOfKey(key) {
+     if(key.remoteJidAlt && isLid(key.remoteJid)) learn(key.remoteJid, key.remoteJidAlt);
+@@ -337,7 +382,7 @@ module.exports = function createBridge(ctx) {
+     const replied = replyWaId && byWaId.get(waKeyOf(chatJid, replyWaId));
+     const m = addMessage(peerKey, from, d.text, tsOf(wm.messageTimestamp), {
+       reply_to: replied ? replied.id : undefined,
+-      replyWaId, jid: chatJid, waId: key.id, kind: d.kind, wstatus: wm.status,
++      replyWaId, jid: chatJid, waId: key.id, kind: d.kind, wstatus: wm.status, mentions: mentionsOf(wm.message),
+       wa: {key: {...key}, message: wm.message}
+     });
+     byWaId.set(waKeyOf(chatJid, key.id), m);
+@@ -433,6 +478,7 @@ module.exports = function createBridge(ctx) {
+         const d = describe(edited);
+         if(d) {
+           m.text = d.text;
++          m.mentions = mentionsOf(edited);
+           m.edit_date = now();
+           if(m.wa) m.wa.message = edited;
+           bumpPts();
+@@ -657,18 +703,40 @@ module.exports = function createBridge(ctx) {
+ 
+   const active = () => !!(WA.getActive() && sock && WA.getActive().sock === sock);
+ 
+-  /** Telegram entities -> WhatsApp markdown (WhatsApp has no entity list) */
++  const MENTION_ENT = {messageEntityMentionName: 1, inputMessageEntityMentionName: 1};
++  const entUserId = (u) => (u && typeof u === 'object' ? (u._ === 'inputUserSelf' ? SELF : u.user_id) : u);
++
++  /**
++   * Telegram entities -> WhatsApp text. Returns {text, mentions}:
++   *  - bold/italic/... become WhatsApp markdown (WhatsApp has no entity list)
++   *  - a mention entity (the shown name) becomes "@<number>" and its JID goes into `mentions` (-> contextInfo.mentionedJid)
++   */
+   function toWaText(text, entities = []) {
++    const ents = entities.map((e) => ({...e}));
++    const mentions = [];
++    let out = text;
++    // mentions first, from the end, shifting the formatting entities around them
++    for(const e of ents.filter((x) => MENTION_ENT[x._]).sort((a, b) => b.offset - a.offset)) {
++      const id = entUserId(e.user_id), jid = id != null && jidOfKey('u' + id);
++      if(!jid) continue; // unknown user: leave the typed name as plain text
++      const tag = '@' + userPart(jid), end = e.offset + e.length, delta = tag.length - e.length;
++      out = out.slice(0, e.offset) + tag + out.slice(end);
++      mentions.unshift(jid);
++      for(const o of ents) {
++        if(o === e || MENTION_ENT[o._]) continue;
++        if(o.offset >= end) o.offset += delta;
++        else if(o.offset <= e.offset && o.offset + o.length >= end) o.length += delta; // the mention sits inside it
++      }
++    }
+     const mark = {messageEntityBold: '*', messageEntityItalic: '_', messageEntityStrike: '~', messageEntityCode: '`', messageEntityPre: '```'};
+     const ops = [];
+-    for(const e of entities) {
++    for(const e of ents) {
+       const m = mark[e._];
+       if(m) ops.push({at: e.offset, text: m, open: true, end: e.offset + e.length}, {at: e.offset + e.length, text: m, open: false});
+     }
+     ops.sort((a, b) => b.at - a.at || (a.open ? -1 : 1)); // from the end so offsets stay valid; at a tie the opener goes in first, so it ends up after the closer
+-    let out = text;
+     for(const o of ops) out = out.slice(0, o.at) + o.text + out.slice(o.at);
+-    return out;
++    return {text: out, mentions: [...new Set(mentions)]};
+   }
+ 
+   function requireSock() {
+@@ -687,10 +755,12 @@ module.exports = function createBridge(ctx) {
+       if(q?.wa) opts.quoted = {key: q.wa.key, message: q.wa.message};
+     }
+     const id = B.generateMessageIDV2 ? B.generateMessageIDV2(s.user?.id) : B.generateMessageID();
++    const w = toWaText(p.message, p.entities);
+     pendingIds.add(id);
+     try {
+-      const sent = await s.sendMessage(jid, {text: toWaText(p.message, p.entities)}, {...opts, messageId: id});
+-      const r = ingest(sent || {key: {remoteJid: jid, fromMe: true, id}, message: {conversation: p.message}, messageTimestamp: now(), status: 2});
++      const sent = await s.sendMessage(jid, {text: w.text, ...(w.mentions.length && {mentions: w.mentions})}, {...opts, messageId: id});
++      const r = ingest(sent || {key: {remoteJid: jid, fromMe: true, id}, status: 2, messageTimestamp: now(),
++        message: w.mentions.length ? {extendedTextMessage: {text: w.text, contextInfo: {mentionedJid: w.mentions}}} : {conversation: w.text}});
+       if(!r) throw fail(500, 'WA_SEND_FAILED');
+       dirty();
+       return r.m;
+@@ -703,11 +773,13 @@ module.exports = function createBridge(ctx) {
+     }
+   }
+ 
+-  async function edit(m, text) {
++  async function edit(m, text, entities) {
+     const s = requireSock();
+     if(!m.wa || !m.out) throw fail(400, 'MESSAGE_EDIT_FORBIDDEN');
+-    try { await s.sendMessage(m.jid, {text, edit: m.wa.key}); } catch(e) { throw fail(500, 'WA_EDIT_FAILED', e.message); }
+-    m.text = text;
++    const w = toWaText(text, entities);
++    try { await s.sendMessage(m.jid, {text: w.text, edit: m.wa.key, ...(w.mentions.length && {mentions: w.mentions})}); } catch(e) { throw fail(500, 'WA_EDIT_FAILED', e.message); }
++    m.text = w.text;
++    m.mentions = mentionPairs(w.mentions);
+     m.edit_date = now();
+     bumpPts();
+     dirty();
+@@ -752,7 +824,7 @@ module.exports = function createBridge(ctx) {
+     if(active() && peerKey[0] === 'u' && +peerKey.slice(1) !== SELF) watch(jidOfKey(peerKey));
+   }
+ 
+-  return {attach, onOpen, whenReady, isReady: () => ready, active, send, edit, del, markRead, setTyping, setOnline, openChat,
++  return {attach, onOpen, whenReady, isReady: () => ready, active, send, edit, del, markRead, setTyping, setOnline, openChat, render,
+     getMessage: async(key) => findMsg(key)?.wa?.message, byId: (id) => msgs.find((m) => m.id === id)};
+ };
+  
+\ No newline at end of file
