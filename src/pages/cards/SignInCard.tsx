@@ -271,12 +271,7 @@ export default function SignInCard(_props: {spec: Spec}) {
         </Button>
         {accountNumber === 1 && <LanguageChangeButton />}
       </div>
-      <Button
-        class="btn-primary btn-secondary btn-primary-transparent primary"
-        disabled={submitting()}
-        onClick={() => navigate({name: 'signQR'})}
-        text="Login.QR.Login"
-      />
+      {/* QR login is off on the WhatsApp backend until auth.exportLoginToken is wired to Baileys' qr event */}
       <PasskeyLoginButton disabled={submitting()} />
     </AuthCard>
   );

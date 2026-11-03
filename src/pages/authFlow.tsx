@@ -26,6 +26,7 @@ import {AccountSentEmailCode, AuthSentCode} from '@layer';
 export type CardName =
   | 'signIn'
   | 'authCode'
+  | 'waPairing'
   | 'emailSetup'
   | 'emailSetupCode'
   | 'password'
@@ -37,6 +38,8 @@ export type CardName =
 export type CardPayloadMap = {
   signIn: void;
   authCode: AuthSentCode.authSentCode & {phone_number?: string};
+  /** WhatsApp login: the sentCode carries `type.pairing_code` to DISPLAY (see WaPairingCard). */
+  waPairing: AuthSentCode.authSentCode & {phone_number?: string};
   emailSetup: {phone_number: string, phone_code_hash: string};
   emailSetupCode: {
     phone_number: string,

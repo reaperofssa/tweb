@@ -12,4 +12,4 @@ trap 'kill 0' EXIT
 VALIDATE=0 PORT=3000 node server.js &
 
 # frontend
-VITE_FAKE_API=https://crispy-fortnight-g456697rr47x25xp-3000.app.github.dev pnpm start
+VITE_FAKE_API=https://ominous-engine-x59xx6vpp565cpgpq-3000.app.github.dev pnpm start

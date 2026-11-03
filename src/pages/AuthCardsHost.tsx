@@ -33,6 +33,7 @@ if(import.meta.hot) import.meta.hot.accept();
 
 const SignInCard = lazy(() => import('@/pages/cards/SignInCard'));
 const AuthCodeCard = lazy(() => import('@/pages/cards/AuthCodeCard'));
+const WaPairingCard = lazy(() => import('@/pages/cards/WaPairingCard'));
 const EmailSetupCard = lazy(() => import('@/pages/cards/EmailSetupCard'));
 const EmailSetupCodeCard = lazy(() => import('@/pages/cards/EmailSetupCodeCard'));
 const PasswordCard = lazy(() => import('@/pages/cards/PasswordCard'));
@@ -227,6 +228,9 @@ function CardsTransition(): JSX.Element {
       </Match>
       <Match when={matchCard('authCode')} keyed>
         {(spec) => <AuthCodeCard spec={spec} />}
+      </Match>
+      <Match when={matchCard('waPairing')} keyed>
+        {(spec) => <WaPairingCard spec={spec} />}
       </Match>
       <Match when={matchCard('emailSetup')} keyed>
         {(spec) => <EmailSetupCard spec={spec} />}

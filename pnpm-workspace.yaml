@@ -1,31 +1,31 @@
 # Keep the whole Tiptap release aligned with the audited editor version.
 overrides:
   '@tiptap/core': &tiptapVersion 3.31.3
-  '@tiptap/extension-blockquote': *tiptapVersion
-  '@tiptap/extension-bold': *tiptapVersion
-  '@tiptap/extension-bullet-list': *tiptapVersion
-  '@tiptap/extension-code': *tiptapVersion
-  '@tiptap/extension-code-block': *tiptapVersion
-  '@tiptap/extension-document': *tiptapVersion
-  '@tiptap/extension-dropcursor': *tiptapVersion
-  '@tiptap/extension-gapcursor': *tiptapVersion
-  '@tiptap/extension-hard-break': *tiptapVersion
-  '@tiptap/extension-heading': *tiptapVersion
-  '@tiptap/extension-horizontal-rule': *tiptapVersion
-  '@tiptap/extension-italic': *tiptapVersion
-  '@tiptap/extension-link': *tiptapVersion
-  '@tiptap/extension-list': *tiptapVersion
-  '@tiptap/extension-list-item': *tiptapVersion
-  '@tiptap/extension-list-keymap': *tiptapVersion
-  '@tiptap/extension-ordered-list': *tiptapVersion
-  '@tiptap/extension-paragraph': *tiptapVersion
-  '@tiptap/extension-strike': *tiptapVersion
-  '@tiptap/extension-table': *tiptapVersion
-  '@tiptap/extension-text': *tiptapVersion
-  '@tiptap/extension-underline': *tiptapVersion
-  '@tiptap/extensions': *tiptapVersion
-  '@tiptap/pm': *tiptapVersion
-  '@tiptap/starter-kit': *tiptapVersion
+  '@tiptap/extension-blockquote': 3.31.3
+  '@tiptap/extension-bold': 3.31.3
+  '@tiptap/extension-bullet-list': 3.31.3
+  '@tiptap/extension-code': 3.31.3
+  '@tiptap/extension-code-block': 3.31.3
+  '@tiptap/extension-document': 3.31.3
+  '@tiptap/extension-dropcursor': 3.31.3
+  '@tiptap/extension-gapcursor': 3.31.3
+  '@tiptap/extension-hard-break': 3.31.3
+  '@tiptap/extension-heading': 3.31.3
+  '@tiptap/extension-horizontal-rule': 3.31.3
+  '@tiptap/extension-italic': 3.31.3
+  '@tiptap/extension-link': 3.31.3
+  '@tiptap/extension-list': 3.31.3
+  '@tiptap/extension-list-item': 3.31.3
+  '@tiptap/extension-list-keymap': 3.31.3
+  '@tiptap/extension-ordered-list': 3.31.3
+  '@tiptap/extension-paragraph': 3.31.3
+  '@tiptap/extension-strike': 3.31.3
+  '@tiptap/extension-table': 3.31.3
+  '@tiptap/extension-text': 3.31.3
+  '@tiptap/extension-underline': 3.31.3
+  '@tiptap/extensions': 3.31.3
+  '@tiptap/pm': 3.31.3
+  '@tiptap/starter-kit': 3.31.3
   # typed-scss-modules still asks for esbuild ^0.17, a line no security fix reaches any more.
   # It only uses it, through bundle-require, to load an optional config file we do not have,
   # so it gets the app's own esbuild instead (keep in step with package.json)
@@ -33,8 +33,10 @@ overrides:
 
 allowBuilds:
   '@parcel/watcher@2.6.0': true
+  '@whiskeysockets/baileys': false
   'cpu-features@0.0.10': true
   'esbuild@0.28.2': true
+  protobufjs: false
   'ssh2@1.17.0': true
 minimumReleaseAgeExclude:
   - 'baseline-browser-mapping@2.11.0'

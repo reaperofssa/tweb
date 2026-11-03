@@ -87,6 +87,11 @@ export function isPhoneLoginExpired(err: ApiError): boolean {
 
 /** Which card continues the login for the code the server just sent. */
 export function sentCodeToCardSpec(sentCode: SentCode): CardSpec {
+  // custom type of the WhatsApp backend: not in the TL schema, so compared as a plain string
+  if((sentCode.type as {_: string})._ === 'auth.sentCodeTypeWaPairing') {
+    return {name: 'waPairing', payload: sentCode};
+  }
+
   if(sentCode.type._ === 'auth.sentCodeTypeSetUpEmailRequired') {
     return {
       name: 'emailSetup',

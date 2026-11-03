@@ -6,7 +6,6 @@ import type DialogsStorage from '@lib/storages/dialogs';
 import type FiltersStorage from '@lib/storages/filters';
 import type {AuthState, Modify} from '@types';
 import type {ShortcutKey as PasscodeLockShortcutKey} from '@components/sidebarLeft/tabs/passcodeLock/shortcutBuilder';
-import {IS_MOBILE} from '@environment/userAgent';
 import getTimeFormat from '@helpers/getTimeFormat';
 import App from '@config/app';
 import {getAccentPresetsForBase} from '@config/themePresets';
@@ -652,7 +651,7 @@ export const STATE_INIT: State = {
   version: STATE_VERSION,
   build: BUILD,
   authState: {
-    _: IS_MOBILE ? 'authStateSignIn' : 'authStateSignQr'
+    _: 'authStateSignIn'
   },
   userId: undefined,
   hiddenPinnedMessages: {},

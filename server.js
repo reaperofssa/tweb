@@ -10,7 +10,7 @@
  *
  * Run:   npm i express ws && TWEB_DIR=/path/to/tweb node server.js
  * Front: VITE_FAKE_API=http://localhost:3000 pnpm start   (in the tweb repo)
- * Login: any phone number, code 12345.
+ * Login: real WhatsApp pairing (phone number -> 8-char code shown in the UI -> enter it in WhatsApp > Linked devices).
  *
  * Everything marked  [WA]  is where Baileys plugs in later.
  */
@@ -19,10 +19,11 @@ const path = require('path');
 const http = require('http');
 const express = require('express');
 const {WebSocketServer} = require('ws');
+const WA = require('./wa-auth'); // real WhatsApp login (Baileys)
+const createBridge = require('./wa-bridge'); // WhatsApp chats <-> this store
 
 const PORT = +process.env.PORT || 3000;
 const TWEB_DIR = process.env.TWEB_DIR || path.join(__dirname, 'tweb');
-const LOGIN_CODE = '12345';
 const SELF = 1000;
 const acct = {premium: process.env.PREMIUM !== '0', stars: +process.env.STARS || 5000}; // PREMIUM=0 to start as a free user
 const now = () => Math.floor(Date.now() / 1000);
@@ -95,8 +96,20 @@ let lastId = 0, pts = 0;
 
 const peerKeyOf = (p) => p && (p._ === 'inputPeerSelf' ? 'u' + SELF : p._ === 'inputPeerUser' || p._ === 'peerUser' ? 'u' + p.user_id : p._ === 'inputPeerChat' || p._ === 'peerChat' ? 'c' + p.chat_id : null);
 const peerOf = (key) => key[0] === 'u' ? {_: 'peerUser', user_id: +key.slice(1)} : {_: 'peerChat', chat_id: +key.slice(1)};
-const keys = () => [...new Set(msgs.map((m) => m.key))];
-const msgsOf = (key) => msgs.filter((m) => m.key === key);
+const keys = () => [...index().keys()];
+// per-chat index, rebuilt lazily when messages were added/removed/renumbered (touch()) - msgs.filter per call does not scale to real accounts
+let msgVer = 0, idxVer = -1, idxLen = -1, idx = new Map();
+const touch = () => { msgVer++; };
+const index = () => {
+  if(idxVer !== msgVer || idxLen !== msgs.length) {
+    idx = new Map();
+    for(const m of msgs) (idx.get(m.key) || idx.set(m.key, []).get(m.key)).push(m);
+    idxVer = msgVer; idxLen = msgs.length;
+  }
+  return idx;
+};
+const msgsOf = (key) => (index().get(key) || []).slice();
+const lastOf = (key) => { const l = index().get(key); return l && l[l.length - 1]; };
 
 function addMessage(key, from, text, date = now(), extra = {}) {
   const m = {id: ++lastId, key, from, text, date, out: from === SELF, ...extra};
@@ -109,9 +122,9 @@ function addMessage(key, from, text, date = now(), extra = {}) {
 const flags = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v));
 const tlUser = (id) => {
   const u = users.get(id) || {first_name: 'User ' + id, last_name: '', phone: String(id)};
-  return {_: 'user', pFlags: flags({self: id === SELF, contact: id !== SELF, mutual_contact: id !== SELF, premium: id === SELF ? acct.premium : !!u.premium}), id, access_hash: '1',
+  return {_: 'user', pFlags: flags({self: id === SELF, contact: id !== SELF && u.contact !== false, mutual_contact: id !== SELF && u.contact !== false, premium: id === SELF ? acct.premium : !!u.premium}), id, access_hash: '1',
     first_name: u.first_name, last_name: u.last_name || '', ...(u.username && {username: u.username}), ...(u.emoji_status && {emoji_status: u.emoji_status}), phone: u.phone,
-    status: {_: 'userStatusRecently', pFlags: {}}};
+    status: u.status || {_: 'userStatusRecently', pFlags: {}}};
 };
 const tlChat = (id) => ({_: 'chat', pFlags: {}, id, title: groups.get(id).title, photo: {_: 'chatPhotoEmpty'},
   participants_count: groups.get(id).members.length, date: now(), version: 1});
@@ -138,7 +151,7 @@ function entities(ms, ks = []) {
   return {users: [...uid].map(tlUser), chats: [...cid].filter((i) => groups.has(i)).map(tlChat)};
 }
 function dialogsResult(ks, type = 'messages.dialogs') {
-  const dialogs = ks.map(tlDialog), tops = ks.map((k) => msgsOf(k).pop()).filter(Boolean);
+  const dialogs = ks.map(tlDialog), tops = ks.map(lastOf).filter(Boolean);
   const r = {_: type, dialogs, messages: tops.map(tlMessage), ...entities(tops, ks)};
   if(type === 'messages.peerDialogs') r.state = state();
   return r;
@@ -159,6 +172,8 @@ function pushIncoming(key, from, text) {
 
 /* ───────────────────────────── method handlers ───────────────────────────── */
 const fail = (code, type, message) => Object.assign(new Error(type), {code, type, message});
+const bridge = createBridge({users, groups, msgs, readState, SELF, push, updatesOf, tlMessage, tlChat, tlUser, addMessage, touch, WA, fail, now, log,
+  getLastId: () => lastId, setLastId: (n) => { lastId = n; }, getPts: () => pts, setPts: (n) => { pts = n; }, bumpPts: () => ++pts});
 const H = {};
 
 // -- bootstrap / config
@@ -178,17 +193,46 @@ H['help.getAppConfig'] = () => ({_: 'help.appConfig', hash: 0, config: {_: 'json
   jn('stargifts_message_length_max', 255), jn('stargifts_pinned_to_top_limit', 6), jn('stars_gifts_enabled', 1)]}});
 H['langpack.getDifference'] = H['langpack.getLangPack'] = (p) => ({_: 'langPackDifference', lang_code: p.lang_code || 'en', from_version: 0, version: 0, strings: []});
 
-// -- auth  [WA] later: sendCode -> request pairing code / QR, signIn -> resolves when Baileys 'connection: open'
-H['auth.sendCode'] = (p) => ({_: 'auth.sentCode', pFlags: {}, type: {_: 'auth.sentCodeTypeApp', length: LOGIN_CODE.length},
-  phone_code_hash: 'sim-' + p.phone_number, timeout: 60});
-H['auth.resendCode'] = H['auth.sendCode'];
-H['auth.cancelCode'] = () => true;
+// -- auth: real WhatsApp pairing through Baileys (see wa-auth.js)
+// sendCode  -> starts a Baileys socket, asks WhatsApp for a pairing code and returns it INSIDE the sentCode
+//              (WhatsApp shows nothing to type: the user types THIS code on the phone, so the UI displays it)
+// signIn    -> polled by the UI's waPairing card; answers WA_PAIRING_PENDING until Baileys reports 'open'
+function applyWaUser(entry) {
+  const u = entry.user || {};
+  const phone = u.phone || entry.phone;
+  const {username, ...rest} = users.get(SELF) || {}; // drop the simulated @me
+  users.set(SELF, {...rest, first_name: u.name || phone, last_name: '', phone}); // [WA] id stays SELF for now
+  push(updatesOf([{_: 'updateUser', user_id: SELF}]));
+}
+WA.init({
+  onOpen: (entry) => { applyWaUser(entry); bridge.onOpen(entry); },
+  onSocket: (entry, sock, baileys) => bridge.attach(entry, sock, baileys),
+  getMessage: (key) => bridge.getMessage(key),
+  onLogout: () => log('WhatsApp session logged out from the phone')
+});
+const waAuthorization = () => ({_: 'auth.authorization', pFlags: {}, user: tlUser(SELF)});
+const waSentCode = (entry, phone_number) => ({_: 'auth.sentCode', pFlags: {},
+  type: {_: 'auth.sentCodeTypeWaPairing', length: 8, pairing_code: entry.code, expires_in: entry.ttl}, phone_code_hash: entry.hash, timeout: 0, phone_number});
+async function waStart(phone_number) {
+  const {entry, linked} = await WA.startPairing(phone_number);
+  if(linked) { applyWaUser(entry); return {_: 'auth.sentCodeSuccess', authorization: waAuthorization()}; }
+  return waSentCode(entry, phone_number);
+}
+H['auth.sendCode'] = (p) => waStart(p.phone_number);
+H['auth.resendCode'] = async(p) => { await WA.cancel(p.phone_code_hash); return waStart(p.phone_number); };
+H['auth.cancelCode'] = async(p) => { await WA.cancel(p.phone_code_hash); return true; };
 H['auth.signIn'] = (p) => {
-  if(p.phone_code !== LOGIN_CODE) throw fail(400, 'PHONE_CODE_INVALID');
-  return {_: 'auth.authorization', pFlags: {}, user: tlUser(SELF)};
+  const entry = WA.status(p.phone_code_hash);
+  if(!entry) throw fail(400, 'PHONE_CODE_INVALID');
+  switch(entry.status) {
+    case 'open': applyWaUser(entry); return waAuthorization();
+    case 'expired': throw fail(400, 'PHONE_CODE_EXPIRED');
+    case 'failed': throw fail(400, 'PHONE_CODE_EXPIRED', 'WhatsApp closed the pairing');
+    default: throw fail(400, 'WA_PAIRING_PENDING'); // connecting | pending
+  }
 };
-H['auth.exportLoginToken'] = () => ({_: 'auth.loginToken', expires: now() + 30, token: new Uint8Array(32).fill(7)});
-H['auth.logOut'] = () => ({_: 'auth.loggedOut', pFlags: {}});
+H['auth.exportLoginToken'] = () => { throw fail(400, 'WA_QR_UNAVAILABLE'); }; // QR login: later
+H['auth.logOut'] = async() => { await WA.logout(); return {_: 'auth.loggedOut', pFlags: {}}; };
 
 // -- users / contacts
 const inputUserId = (u) => (u._ === 'inputUserSelf' ? SELF : u.user_id);
@@ -199,7 +243,7 @@ H['users.getFullUser'] = (p) => {
     notify_settings: {_: 'peerNotifySettings', pFlags: {}}, common_chats_count: 0}, chats: [], users: [tlUser(id)]};
 };
 H['contacts.getContacts'] = () => {
-  const ids = [...users.keys()].filter((i) => i !== SELF);
+  const ids = [...users].filter(([i, u]) => i !== SELF && u.contact !== false).map(([i]) => i);
   return {_: 'contacts.contacts', contacts: ids.map((i) => ({_: 'contact', user_id: i, mutual: true})), saved_count: 0, users: ids.map(tlUser)};
 };
 H['contacts.resolveUsername'] = (p) => {
@@ -218,13 +262,22 @@ H['updates.getState'] = () => state();
 H['updates.getDifference'] = () => ({_: 'updates.difference', new_messages: [], new_encrypted_messages: [], other_updates: [], chats: [], users: [], state: state()});
 
 // -- dialogs / history
-H['messages.getDialogs'] = (p) => (p.folder_id === 1 || p.offset_date > 0 ? dialogsResult([]) :
-  dialogsResult(keys().sort((a, b) => msgsOf(b).pop().id - msgsOf(a).pop().id)));
+H['messages.getDialogs'] = (p) => {
+  if(p.folder_id === 1) return dialogsResult([]);
+  let ks = keys().sort((a, b) => lastOf(b).id - lastOf(a).id);
+  if(p.offset_id > 0) ks = ks.filter((k) => lastOf(k).id < p.offset_id);
+  else if(p.offset_date > 0) ks = ks.filter((k) => lastOf(k).date < p.offset_date);
+  const limit = p.limit > 0 ? p.limit : 100, page = ks.slice(0, limit);
+  const r = dialogsResult(page);
+  if(ks.length > limit) { r._ = 'messages.dialogsSlice'; r.count = keys().length; }
+  return r;
+};
 H['messages.getPinnedDialogs'] = () => dialogsResult([], 'messages.peerDialogs');
 H['messages.getPeerDialogs'] = (p) => dialogsResult(p.peers.map((x) => peerKeyOf(x.peer)).filter(Boolean), 'messages.peerDialogs');
 H['messages.getDialogFilters'] = () => ({_: 'messages.dialogFilters', pFlags: {}, filters: []});
 H['messages.getHistory'] = (p) => {
   const key = peerKeyOf(p.peer);
+  if(key) bridge.openChat(key);
   let list = msgsOf(key);
   if(p.offset_id > 0) list = list.filter((m) => m.id < p.offset_id);
   if(p.max_id > 0) list = list.filter((m) => m.id < p.max_id);
@@ -238,32 +291,40 @@ H['messages.getMessages'] = (p) => {
 };
 
 // -- sending  [WA] later: await sock.sendMessage(jid, {text}); then build the same update from its result
-H['messages.sendMessage'] = (p) => {
+H['messages.sendMessage'] = async(p) => {
   const key = peerKeyOf(p.peer);
   if(!key) throw fail(400, 'PEER_ID_INVALID');
+  if(bridge.active()) {
+    const wm = await bridge.send(key, p);
+    return updatesOf([{_: 'updateMessageID', id: wm.id, random_id: p.random_id},
+      {_: 'updateNewMessage', message: tlMessage(wm), pts, pts_count: 1}], [wm]);
+  }
   const reply = p.reply_to?.reply_to_msg_id;
   const m = addMessage(key, SELF, p.message, now(), {reply_to: reply});
   if(key[0] === 'u' && key !== 'u' + SELF) simulateReply(key, p.message); // fake contact answers
   return updatesOf([{_: 'updateMessageID', id: m.id, random_id: p.random_id},
     {_: 'updateNewMessage', message: tlMessage(m), pts, pts_count: 1}], [m]);
 };
-H['messages.editMessage'] = (p) => {
+H['messages.editMessage'] = async(p) => {
   const m = msgs.find((x) => x.id === p.id);
   if(!m) throw fail(400, 'MESSAGE_ID_INVALID');
-  m.text = p.message ?? m.text; m.edit_date = now(); pts++;
+  if(bridge.active() && m.wa) await bridge.edit(m, p.message ?? m.text);
+  else { m.text = p.message ?? m.text; m.edit_date = now(); pts++; }
   return updatesOf([{_: 'updateEditMessage', message: tlMessage(m), pts, pts_count: 1}], [m]);
 };
-H['messages.deleteMessages'] = (p) => {
+H['messages.deleteMessages'] = async(p) => {
   const ids = new Set(p.id);
-  for(let i = msgs.length - 1; i >= 0; i--) if(ids.has(msgs[i].id)) msgs.splice(i, 1);
+  if(bridge.active()) await bridge.del(msgs.filter((m) => ids.has(m.id)), !!p.revoke);
+  else for(let i = msgs.length - 1; i >= 0; i--) if(ids.has(msgs[i].id)) msgs.splice(i, 1);
   return {_: 'messages.affectedMessages', pts: ++pts, pts_count: p.id.length};
 };
 H['messages.readHistory'] = (p) => {
   const key = peerKeyOf(p.peer), rs = readState[key] || (readState[key] = {inbox: 0, outbox: 0});
+  if(bridge.active()) bridge.markRead(key, p.max_id);
   rs.inbox = Math.max(rs.inbox, p.max_id || lastId);
   return {_: 'messages.affectedMessages', pts: ++pts, pts_count: 1};
 };
-H['messages.setTyping'] = () => true;
+H['messages.setTyping'] = (p) => { const key = peerKeyOf(p.peer); if(key) bridge.setTyping(key, p.action); return true; };
 H['messages.getAllDrafts'] = () => updatesOf([]);
 
 /** Fake contact: "typing…" then echoes. [WA] delete this; real replies arrive via Baileys messages.upsert */
@@ -318,7 +379,7 @@ H['account.getPassword'] = () => ({_: 'account.password', pFlags: {}, new_algo: 
 H['account.getAccountTTL'] = () => ({_: 'accountDaysTTL', days: 365});
 H['account.getWallPapers'] = () => ({_: 'account.wallPapers', hash: 0, wallpapers: []});
 H['account.getThemes'] = () => ({_: 'account.themes', hash: 0, themes: []});
-H['account.updateStatus'] = () => true;
+H['account.updateStatus'] = (p) => { bridge.setOnline(!p.offline); return true; };
 H['account.checkUsername'] = (p) => ![...users].some(([i, u]) => i !== SELF && u.username === p.username);
 H['account.updateUsername'] = (p) => { users.get(SELF).username = p.username || undefined; return tlUser(SELF); };
 H['account.updateProfile'] = (p) => {
@@ -890,9 +951,11 @@ app.use((req, res, next) => {
 });
 app.use(express.json({limit: '100mb', reviver: jsonReviver}));
 
+const GATED = /^(messages|contacts|users|updates)\./;
 app.post('/api', async(req, res) => {
   const {method, params = {}} = req.body || {};
   try {
+    if(GATED.test(method) && !bridge.isReady()) await bridge.whenReady(); // first link: wait for WhatsApp's history
     const result = H[method] ? await H[method](params) : fallback(method);
     if(process.env.VALIDATE) checkResult(method, result);
     log(`${H[method] ? '·' : '~'} ${method}`);
@@ -964,4 +1027,5 @@ addMessage('c2001', 1001, 'Hi all', t + 2460);
 addMessage('u1000', SELF, 'Saved note', t + 3000);
 readState['u1001'] = {inbox: lastId - 6 + 1, outbox: 0}; // first message read, last one unread
 
-server.listen(PORT, () => log('build 82: resale purchase + value info') || log(`simulated backend on http://localhost:${PORT}  (login code ${LOGIN_CODE})`));
+server.listen(PORT, () => log('build 84: WhatsApp chats') || log(`backend on http://localhost:${PORT}  (login: WhatsApp pairing code)`));
+WA.restore().then((e) => e && log('WhatsApp session restored for', e.phone)).catch((e) => log('! WA restore failed:', e.message));

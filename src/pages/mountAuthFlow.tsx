@@ -108,7 +108,7 @@ function authStateToCardSpec(authState: MountAuthFlowState): CardSpec {
     case 'authStateSignIn':
       return {name: 'signIn'};
     case 'authStateSignQr':
-      return {name: 'signQR'};
+      return {name: 'signIn'}; // QR login is off on the WhatsApp backend
     case 'authStateAuthCode':
       return {name: 'authCode', payload: authState.sentCode};
     case 'authStateEmailSetup':
