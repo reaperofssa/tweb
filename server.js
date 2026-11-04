@@ -206,9 +206,29 @@ const updatesOf = (updates, ms = []) => ({_: 'updates', updates, ...entities(ms)
 
 /* ───────────────────────────── live updates (WS) ───────────────────────────── */
 const sockets = new Set();
+// Journal of the updates that getDifference cannot rebuild from the message store (edits, deletes, read marks).
+// A client whose websocket was down (sleeping tab, flaky mobile network, server restart) replays them through updates.getDifference.
+const JOURNAL_MAX = +process.env.JOURNAL_MAX || 2000, JOURNAL_TTL_S = +process.env.JOURNAL_TTL_S || 3 * 86400;
+const journal = []; // {pts, date, update, users, chats}
+const JOURNALED = new Set(['updateEditMessage', 'updateDeleteMessages', 'updateReadHistoryInbox', 'updateReadHistoryOutbox']);
+function journalize(obj) {
+  const ups = obj?._ === 'updates' ? obj.updates : obj?._ === 'updateShort' ? [obj.update] : [];
+  for(const u of ups || []) {
+    if(!u || !JOURNALED.has(u._) || !u.pts) continue;
+    journal.push({pts: u.pts, date: now(), update: u, users: obj.users || [], chats: obj.chats || []});
+  }
+  const min = now() - JOURNAL_TTL_S;
+  while(journal.length > JOURNAL_MAX || (journal.length && journal[0].date < min)) journal.shift();
+}
 function push(obj) {
+  try { journalize(obj); } catch(e) { log('journal error:', e.message); }
   const data = JSON.stringify(obj, jsonReplacer);
-  for(const s of sockets) if(s.readyState === 1) s.send(data);
+  let sent = 0;
+  for(const s of sockets) {
+    if(s.readyState !== 1) continue;
+    try { s.send(data); sent++; } catch(e) { log('ws send failed:', e.message); try { s.terminate(); } catch(_) { /* ignore */ } }
+  }
+  if(!sent && obj?._ !== 'updateShort') log(`push with no live socket (${obj?._}); the client will catch up with getDifference`);
 }
 function pushIncoming(key, from, text) {
   const m = addMessage(key, from, text);
@@ -308,10 +328,24 @@ H['contacts.getTopPeers'] = () => ({_: 'contacts.topPeersDisabled'});
 
 // -- updates
 H['updates.getState'] = () => state();
-H['updates.getDifference'] = (p) => { // a pts hole on the client (answer and push crossed, ws reconnect) must not lose messages
-  const since = p.pts || 0, min = now() - 6 * 3600;
-  const fresh = msgs.filter((m) => m.pts > since && m.date >= min).slice(-300);
-  return {_: 'updates.difference', new_messages: fresh.map(tlMessage), new_encrypted_messages: [], other_updates: [], ...entities(fresh), state: state()};
+H['updates.getDifference'] = (p) => { // a pts hole on the client (answer and push crossed, ws reconnect, tab asleep) must not lose anything
+  const since = p.pts || 0, LIMIT = 200, MAX_BEHIND = +process.env.DIFF_MAX_BEHIND || 3000;
+  const missing = msgs.filter((m) => m.pts > since).sort((a, b) => a.pts - b.pts);
+  if(!since || missing.length > MAX_BEHIND) return {_: 'updates.differenceTooLong', pts}; // tweb refetches the dialogs
+  const slice = missing.slice(0, LIMIT), more = missing.length > LIMIT;
+  const upTo = more ? slice[slice.length - 1].pts : pts;
+  const jr = journal.filter((e) => e.pts > since && e.pts <= upTo);
+  const seenU = new Set(), seenC = new Set(), extraU = [], extraC = [];
+  for(const e of jr) {
+    for(const u of e.users) if(u?.id != null && !seenU.has(u.id)) { seenU.add(u.id); extraU.push(u); }
+    for(const c of e.chats) if(c?.id != null && !seenC.has(c.id)) { seenC.add(c.id); extraC.push(c); }
+  }
+  const ent = entities(slice);
+  for(const u of ent.users) if(!seenU.has(u.id)) extraU.push(u);
+  for(const c of ent.chats) if(!seenC.has(c.id)) extraC.push(c);
+  const base = {new_messages: slice.map(tlMessage), new_encrypted_messages: [], other_updates: jr.map((e) => e.update), users: extraU, chats: extraC};
+  if(more) return {_: 'updates.differenceSlice', ...base, intermediate_state: {...state(), pts: upTo}};
+  return {_: 'updates.difference', ...base, state: state()};
 };
 
 // -- dialogs / history
@@ -1173,19 +1207,42 @@ app.use(express.json({limit: '100mb', reviver: jsonReviver}));
 // Only calls whose answer depends on WhatsApp's history (message ids are numbered once, when history finishes) wait.
 // Everything else (auth check users.*, updates.getState, reactions, stickers, filters, config...) answers instantly so the UI shell shows up right away.
 const GATED = /^(messages\.(getDialogs|getPeerDialogs|getHistory|getMessages|getReplies|search|searchGlobal|getSearchCounters|getUnreadMentions|getUnreadReactions|getRecentLocations)|contacts\.(getContacts|search))$/;
+// A client that lost the answer (network drop, sleeping server) retries the same call with the same random_id:
+// the first result is replayed instead of sending the WhatsApp message a second time.
+const idem = new Map(); // `${method}:${random_id}` -> Promise<string> (the serialized answer)
+const IDEM_TTL_MS = 10 * 60 * 1000, IDEM_MAX = 3000;
+function idemKey(method, params) {
+  const r = params?.random_id;
+  if(r == null) return null;
+  const id = Array.isArray(r) ? r.join(',') : typeof r === 'object' ? JSON.stringify(r, jsonReplacer) : String(r);
+  return `${method}:${id}`;
+}
 app.post('/api', async(req, res) => {
   const {method, params = {}} = req.body || {};
-  try {
-    if(GATED.test(method) && !bridge.isReady()) await bridge.whenReady(); // first link: wait for WhatsApp's history
-    const result = H[method] ? await H[method](params) : fallback(method);
-    if(process.env.VALIDATE) checkResult(method, result);
-    if(LOG_REQ) log(`${H[method] ? '·' : '~'} ${method}`);
-    res.type('json').send(JSON.stringify({result}, jsonReplacer));
-  } catch(e) {
-    log(`! ${method} -> ${e.type || e.message}`);
-    res.type('json').send(JSON.stringify({error: {code: e.code || 500, type: e.type || 'INTERNAL', message: e.message}}));
+  const ik = /^messages\.(send|forward)/.test(method) ? idemKey(method, params) : null;
+  if(ik && idem.has(ik)) { log(`replaying ${method} (retry with the same random_id)`); return res.type('json').send(await idem.get(ik)); }
+  const run = (async() => {
+    try {
+      if(GATED.test(method) && !bridge.isReady()) await bridge.whenReady(); // first link: wait for WhatsApp's history
+      const result = H[method] ? await H[method](params) : fallback(method);
+      if(process.env.VALIDATE) checkResult(method, result);
+      if(LOG_REQ) log(`${H[method] ? '·' : '~'} ${method}`);
+      return {ok: true, body: JSON.stringify({result}, jsonReplacer)};
+    } catch(e) {
+      log(`! ${method} -> ${e.type || e.message}`);
+      return {ok: false, body: JSON.stringify({error: {code: e.code || 500, type: e.type || 'INTERNAL', message: e.message}})};
+    }
+  })();
+  if(ik) {
+    // only successful sends are replayed; a failed one may be retried for real
+    idem.set(ik, run.then((r) => r.body));
+    run.then((r) => { if(!r.ok) idem.delete(ik); }).catch(() => idem.delete(ik));
+    setTimeout(() => idem.delete(ik), IDEM_TTL_MS).unref?.();
+    while(idem.size > IDEM_MAX) idem.delete(idem.keys().next().value);
   }
+  res.type('json').send((await run).body);
 });
+app.get('/health', (_req, res) => res.json({ok: true, uptime: Math.round(process.uptime()), whatsapp: bridge.active(), ready: bridge.isReady(), sockets: sockets.size, pts, journal: journal.length}));
 app.get('/debug/unhandled', (_req, res) => res.json(unhandled));
 // /debug/premium?on=1|0     -> toggles Premium live (pushes updateUser)
 app.get('/debug/premium', (req, res) => {
@@ -1230,12 +1287,33 @@ app.get('/debug/gift', (req, res) => {
 });
 app.get('/', (_req, res) => res.send('tweb simulated backend: POST /api, WS /updates, GET /debug/unhandled|premium|stars|gift'));
 
+// A bridge has to outlive a stray Baileys / network error: log it and keep serving instead of dying (and dropping the WhatsApp link with it).
+process.on('unhandledRejection', (e) => log('! unhandledRejection:', e?.stack || e));
+process.on('uncaughtException', (e) => log('! uncaughtException:', e?.stack || e));
+
 const server = http.createServer(app);
-new WebSocketServer({server, path: '/updates'}).on('connection', (ws) => {
+const wss = new WebSocketServer({server, path: '/updates'});
+wss.on('connection', (ws) => {
   sockets.add(ws);
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+  ws.on('message', () => { ws.isAlive = true; }); // the client's own heartbeat counts too
+  ws.on('error', (e) => log('ws error:', e.message));
   ws.on('close', () => sockets.delete(ws));
-  log('updates socket connected');
+  log(`updates socket connected (${sockets.size} open)`);
 });
+// Heartbeat: proxies (Render, Cloudflare, mobile carriers) silently drop idle sockets, and a half-dead socket looks open
+// to ws.readyState while every update sent into it is lost. Ping twice per interval, kill what does not answer, and send an
+// app-level tick so the browser can run its own watchdog (browsers do not expose protocol pings).
+const HEARTBEAT_MS = +process.env.WS_HEARTBEAT_MS || 20000;
+setInterval(() => {
+  const tick = JSON.stringify({_: 'wsTick', t: Date.now()});
+  for(const ws of wss.clients) {
+    if(ws.isAlive === false) { log('terminating a dead updates socket'); ws.terminate(); sockets.delete(ws); continue; }
+    ws.isAlive = false;
+    try { ws.ping(); if(ws.readyState === 1) ws.send(tick); } catch(_) { ws.terminate(); }
+  }
+}, HEARTBEAT_MS).unref();
 
 /* seed */
 const t = now() - 3600;
