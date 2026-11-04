@@ -59,6 +59,12 @@ module.exports = function createBridge(ctx) {
   const watched = new Map(); // jid -> when presence was subscribed
   const metaCache = new Map(); // group jid -> latest Baileys GroupMetadata (handed back to Baileys through cachedGroupMetadata)
   let metaChain = Promise.resolve(), metaBackoffUntil = 0;
+  // profile pictures: one WhatsApp query per jid, so they go through a slow queue and are cached on disk
+  const PIC_DIR = process.env.WA_PIC_DIR || path.join(__dirname, 'wa-pics');
+  const PIC_GAP_MS = +process.env.WA_PIC_GAP_MS || 700; // gap between two picture queries
+  const PIC_RECHECK_S = +process.env.WA_PIC_RECHECK_S || 86400; // re-ask WhatsApp about a known picture (or lack of one) after this
+  const picQueue = [], picQueued = new Set(), picForce = new Set();
+  let picRunning = false, picBackoffUntil = 0;
 
   function freshReg() {
     return {next: REG_START, byJid: {}, jidById: {}, lidToPn: {}, self: {phones: [], lids: []}};
@@ -180,8 +186,9 @@ module.exports = function createBridge(ctx) {
     if(!u) {
       u = {first_name: '', last_name: '', phone: server === 's.whatsapp.net' ? user : '', rank: -1, contact: false, ...(server !== 's.whatsapp.net' && {jid})};
       users.set(id, u);
+      wantPic('u' + id);
     }
-    if(name && rank > u.rank) { u.first_name = String(name); u.last_name = ''; u.rank = rank; }
+    if(name && rank >= u.rank) { u.first_name = String(name); u.last_name = ''; u.rank = rank; } // >= : a changed pushName (same rank) must win
     if(!u.first_name) u.first_name = u.phone ? '+' + u.phone : 'WhatsApp user';
     return id;
   }
@@ -194,7 +201,7 @@ module.exports = function createBridge(ctx) {
     jid = norm(jid);
     const id = idOf(jid);
     let g = groups.get(id);
-    if(!g) { g = {title: title || 'WhatsApp group', members: [SELF], jid}; groups.set(id, g); }
+    if(!g) { g = {title: title || 'WhatsApp group', members: [SELF], jid}; groups.set(id, g); wantPic('c' + id); }
     else if(title && g.title !== title) {
       g.title = title;
       if(ready) push({_: 'updates', updates: [{_: 'updateChat', chat_id: id}], users: [], chats: [tlChat(id)], date: now(), seq: 0});
@@ -294,6 +301,136 @@ module.exports = function createBridge(ctx) {
 
   /** Baileys asks this before every group send / receive instead of hitting WhatsApp */
   const groupMeta = (jid) => metaCache.get(norm(jid)) || fetchMeta(jid);
+
+  /* ───────────────────────────── profile pictures ─────────────────────────────
+   * users[id].pic / groups[id].pic = {id, at}: id is the Telegram photo_id (hash of the image, 0 = no picture / hidden), at = last check.
+   * server.js puts it in tlUser / tlChat; tweb then asks upload.getFile(inputPeerPhotoFileLocation) -> pic(key, big).
+   * 'preview' (small) is fetched for every peer, 'image' (big) only when tweb opens a profile. */
+
+  const picFile = (key, big) => path.join(PIC_DIR, key + (big ? '.big' : '') + '.jpg');
+  const picRec = (key) => (key[0] === 'u' ? users.get(+key.slice(1)) : groups.get(+key.slice(1)));
+  const picIdOf = (key, buf) => crypto.createHash('sha1').update(key + ':').update(buf).digest().readUIntBE(0, 6) || 1; // < 2^48, safe as a JS number
+
+  function dropPicFiles(key) {
+    for(const big of [false, true]) fs.promises.unlink(picFile(key, big)).catch(() => {});
+  }
+
+  function announcePic(key) {
+    if(!ready) return;
+    const id = +key.slice(1);
+    if(key[0] === 'u') pushUser(id);
+    else if(groups.has(id)) push({_: 'updates', updates: [{_: 'updateChat', chat_id: id}], users: [], chats: [tlChat(id)], date: now(), seq: 0});
+  }
+
+  async function fetchBuf(url) {
+    const r = await fetch(url, {signal: AbortSignal.timeout(20000)});
+    if(!r.ok) throw new Error('picture download ' + r.status);
+    return Buffer.from(await r.arrayBuffer());
+  }
+
+  /** hidden by privacy (401/403) or none set (404) are normal answers, not errors */
+  const picGone = (e) => [401, 403, 404].includes(e?.data) || /not-authorized|item-not-found|forbidden/i.test(String(e?.message));
+
+  async function fetchPic(key) {
+    const rec = picRec(key);
+    if(!rec || !sock) return;
+    const jid = jidOfKey(key) || rec.jid;
+    if(!jid) return;
+    let url;
+    try { url = await sock.profilePictureUrl(jid, 'preview', 20000); }
+    catch(e) {
+      if(picGone(e)) url = null;
+      else if(isRateLimit(e)) { picBackoffUntil = now() + 1800; log('picture queries rate limited, pausing 30 min'); picQueued.add(key); picQueue.unshift(key); return; }
+      else { log(`picture ${jid} failed:`, e.message); return; } // timeout etc: retried at the next recheck
+    }
+    const prev = rec.pic?.id || 0;
+    if(!url) {
+      rec.pic = {id: 0, at: now()};
+      if(prev) { dropPicFiles(key); announcePic(key); }
+      dirty();
+      return;
+    }
+    let buf;
+    try { buf = await fetchBuf(url); } catch(e) { log(`picture ${jid} download failed:`, e.message); return; }
+    const id = picIdOf(key, buf);
+    rec.pic = {id, at: now()};
+    if(id !== prev || !fs.existsSync(picFile(key, false))) {
+      try { await fs.promises.mkdir(PIC_DIR, {recursive: true}); await fs.promises.writeFile(picFile(key, false), buf); } catch(e) { log('picture cache write failed:', e.message); }
+      if(id !== prev) { fs.promises.unlink(picFile(key, true)).catch(() => {}); announcePic(key); }
+    }
+    dirty();
+  }
+
+  async function pumpPics() {
+    if(picRunning) return;
+    picRunning = true;
+    try {
+      while(picQueue.length && ready && active() && now() >= picBackoffUntil) {
+        const key = picQueue.shift();
+        picQueued.delete(key);
+        const forced = picForce.delete(key);
+        const rec = picRec(key);
+        if(!rec || (!forced && rec.pic && now() - rec.pic.at < PIC_RECHECK_S)) continue;
+        await fetchPic(key);
+        await new Promise((r) => setTimeout(r, PIC_GAP_MS));
+      }
+    } finally { picRunning = false; }
+  }
+
+  /** queue a picture check. front = visible / just changed, force = ignore the recheck interval */
+  function wantPic(key, front, force) {
+    if(!key || !picRec(key)) return;
+    if(force) picForce.add(key);
+    else if(picRec(key).pic && now() - picRec(key).pic.at < PIC_RECHECK_S) return;
+    if(picQueued.has(key)) {
+      if(front) { picQueue.splice(picQueue.indexOf(key), 1); picQueue.unshift(key); }
+    } else { picQueued.add(key); if(front) picQueue.unshift(key); else picQueue.push(key); }
+    pumpPics();
+  }
+
+  /** WhatsApp says a picture changed / was removed (contacts.update imgUrl; for groups also the GROUP_CHANGE_ICON stub) */
+  function onPicEvent(c) {
+    if(!c?.id || (c.imgUrl !== 'changed' && c.imgUrl !== 'removed')) return;
+    const key = chatKeyOf(c.id);
+    if(!key) return;
+    if(key[0] === 'u') ensureUser(c.id, null); else ensureGroup(c.id);
+    const rec = picRec(key);
+    if(c.imgUrl === 'removed') {
+      if(rec.pic?.id) { rec.pic = {id: 0, at: now()}; dropPicFiles(key); announcePic(key); }
+      else rec.pic = {id: 0, at: now()};
+    } else wantPic(key, true, true);
+  }
+
+  /** after (re)connect / history: recent chats first, then groups, then everybody else */
+  function seedPics() {
+    for(const k of [...new Set(msgs.slice(-600).map((m) => m.key))].reverse()) wantPic(k);
+    for(const id of groups.keys()) wantPic('c' + id);
+    for(const id of users.keys()) wantPic('u' + id);
+    pumpPics();
+  }
+
+  /** bytes for upload.getFile(inputPeerPhotoFileLocation) */
+  async function pic(key, big) {
+    const rec = picRec(key);
+    if(!rec?.pic?.id) return null;
+    const read = (f) => fs.promises.readFile(f).catch(() => null);
+    if(big) {
+      const cached = await read(picFile(key, true));
+      if(cached) return cached;
+      const jid = jidOfKey(key) || rec.jid;
+      if(active() && jid) {
+        try {
+          const buf = await fetchBuf(await sock.profilePictureUrl(jid, 'image', 20000));
+          await fs.promises.mkdir(PIC_DIR, {recursive: true});
+          fs.promises.writeFile(picFile(key, true), buf).catch(() => {});
+          return buf;
+        } catch(e) { log(`big picture ${jid} failed:`, e.message); }
+      }
+    }
+    let buf = await read(picFile(key, false));
+    if(!buf && active()) { await fetchPic(key); buf = await read(picFile(key, false)); } // cache dir was wiped
+    return buf;
+  }
 
   /* ───────────────────────────── message content ───────────────────────────── */
 
@@ -554,6 +691,7 @@ module.exports = function createBridge(ctx) {
     dirty();
     refreshGroups();
     watchTop();
+    seedPics();
   }
 
   const whenReady = () => (ready ? Promise.resolve() : new Promise((r) => waiters.push(r)));
@@ -697,7 +835,7 @@ module.exports = function createBridge(ctx) {
     safe('messages.update', onMessagesUpdate);
     safe('presence.update', onPresence);
     safe('contacts.upsert', (l) => { l.forEach((c) => upsertContact(c, true)); dirty(); });
-    safe('contacts.update', (l) => { l.forEach((c) => upsertContact(c, true)); dirty(); });
+    safe('contacts.update', (l) => { l.forEach((c) => { onPicEvent(c); upsertContact(c, true); }); dirty(); });
     safe('chats.upsert', (l) => { l.forEach(upsertChat); dirty(); });
     safe('chats.update', (l) => { onChatsUpdate(l); dirty(); });
     safe('lid-mapping.update', ({lid, pn}) => learn(lid, pn));
@@ -756,6 +894,7 @@ module.exports = function createBridge(ctx) {
     } else {
       refreshGroups();
       watchTop();
+      seedPics();
     }
     dirty();
   }
@@ -985,7 +1124,7 @@ module.exports = function createBridge(ctx) {
     if(active() && peerKey[0] === 'u' && +peerKey.slice(1) !== SELF) watch(jidOfKey(peerKey));
   }
 
-  return {attach, onOpen, whenReady, isReady: () => ready, active, send, edit, del, markRead, setTyping, setOnline, openChat, render, groupMeta, download, sendMedia, markDirty: dirty,
+  return {attach, onOpen, whenReady, isReady: () => ready, active, send, edit, del, markRead, setTyping, setOnline, openChat, render, groupMeta, download, sendMedia, pic, markDirty: dirty,
     getMessage: async(key) => findMsg(key)?.wa?.message, byId: (id) => msgs.find((m) => m.id === id)};
 };
  
