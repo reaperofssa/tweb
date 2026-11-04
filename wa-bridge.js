@@ -45,7 +45,7 @@ const GROUPS_TTL_S = +process.env.WA_GROUPS_TTL_S || 1800; // never call groupFe
 const META_GAP_MS = 1500; // single-group metadata fetches are serialised with this gap
 
 module.exports = function createBridge(ctx) {
-  const {users, groups, msgs, readState, SELF, push, updatesOf, tlMessage, tlChat, tlUser, addMessage,
+  const {tlReactionsOf, users, groups, msgs, readState, SELF, push, updatesOf, tlMessage, tlChat, tlUser, addMessage,
     getLastId, setLastId, getPts, setPts, bumpPts, touch, log: baseLog, now, WA, fail} = ctx;
   const log = (...a) => baseLog('[bridge]', ...a);
 
@@ -693,6 +693,10 @@ module.exports = function createBridge(ctx) {
       wa: {key: {...key}, message: wm.message}
     });
     byWaId.set(waKeyOf(chatJid, key.id), m);
+    for(const r of wm.reactions || []) { // WebMessageInfo.reactions: what history sync carries
+      if(r?.key) setReaction(m, reactorOf(r.key, key), r.text || '', r.senderTimestampMs ? Math.floor(Number(r.senderTimestampMs) / 1000) : now());
+    }
+    applyPending(m, chatJid, key.id);
     return {m, dup: false};
   }
 
@@ -824,6 +828,62 @@ module.exports = function createBridge(ctx) {
     dirty();
   }
 
+  /* ───────────────────────────── reactions ───────────────────────────── */
+
+  /** WhatsApp keeps one reaction per user per message: m.rx = {emoji: [uid, ...]}; empty emoji removes the user's reaction */
+  function setReaction(m, uid, emoji, date = now()) {
+    const rx = m.rx || (m.rx = {}), at = m.rxAt || (m.rxAt = {});
+    for(const e of Object.keys(rx)) {
+      rx[e] = rx[e].filter((u) => u !== uid);
+      if(!rx[e].length) delete rx[e];
+    }
+    delete at[uid];
+    if(emoji) { (rx[emoji] || (rx[emoji] = [])).push(uid); at[uid] = date; }
+    if(!Object.keys(rx).length) { delete m.rx; delete m.rxAt; }
+    dirty();
+  }
+
+  function pushReactions(m) {
+    bumpPts(); // gives the update a pts so the journal can replay it through getDifference for a client that was offline
+    if(ready) push(updatesOf([{_: 'updateMessageReactions', peer: peerOf(m.key), msg_id: m.id, reactions: tlReactionsOf(m), pts: getPts(), pts_count: 1}], [m]));
+  }
+
+  /** reactions that arrived before their message (or before history was ready) wait here until the message is known */
+  const pendingRx = new Map(); // waKey -> [{uid, text, date}]
+  const reactorOf = (rk, key) => (rk?.fromMe ? SELF : ensureUser(norm(rk?.participantAlt || rk?.participant || rk?.remoteJid || key.remoteJid)));
+  function applyPending(m, chatJid, waId) {
+    const k = waKeyOf(chatJid, waId), q = pendingRx.get(k);
+    if(!q) return;
+    pendingRx.delete(k);
+    for(const r of q) setReaction(m, r.uid, r.text, r.date);
+  }
+
+  async function react(m, emoji) {
+    const s = requireSock();
+    if(!m.wa) throw fail(400, 'MESSAGE_ID_INVALID');
+    try { await s.sendMessage(m.jid, {react: {text: emoji || '', key: m.wa.key}}); } catch(e) { throw fail(500, 'WA_REACT_FAILED', e.message); }
+    setReaction(m, SELF, emoji);
+    return m;
+  }
+
+  /** baileys 'messages.reaction': [{key: <reacted message>, reaction: {text, key: <reactor's key>, senderTimestampMs}}]; empty text = reaction removed */
+  function onReactions(list) {
+    for(const {key, reaction} of list) {
+      if(!key?.remoteJid || !key.id || !reaction) continue;
+      const chatJid = chatJidOfKey(key), uid = reactorOf(reaction.key, key);
+      const date = reaction.senderTimestampMs ? Math.floor(Number(reaction.senderTimestampMs) / 1000) : now();
+      const m = findMsg(key);
+      if(!m) {
+        const k = waKeyOf(chatJid, key.id);
+        if(!pendingRx.has(k) && pendingRx.size >= 500) pendingRx.delete(pendingRx.keys().next().value);
+        (pendingRx.get(k) || pendingRx.set(k, []).get(k)).push({uid, text: reaction.text || '', date});
+        continue;
+      }
+      setReaction(m, uid, reaction.text || '', date);
+      pushReactions(m);
+    }
+  }
+
   const peerOf = (key) => (key[0] === 'u' ? {_: 'peerUser', user_id: +key.slice(1)} : {_: 'peerChat', chat_id: +key.slice(1)});
 
   function removeMessage(m, announceIt) {
@@ -906,6 +966,7 @@ module.exports = function createBridge(ctx) {
     safe('messaging-history.set', onHistory);
     safe('messages.upsert', onUpsert);
     safe('messages.update', onMessagesUpdate);
+    safe('messages.reaction', onReactions);
     safe('presence.update', onPresence);
     safe('contacts.upsert', (l) => { l.forEach((c) => upsertContact(c, true)); dirty(); });
     safe('contacts.update', (l) => { l.forEach((c) => { onPicEvent(c); upsertContact(c, true); }); dirty(); });
@@ -1243,7 +1304,7 @@ module.exports = function createBridge(ctx) {
     if(jid && !metaCache.has(jid)) fetchMeta(jid);
   }
 
-  return {attach, onOpen, whenReady, isReady: () => ready, active, send, edit, del, markRead, setTyping, setOnline, openChat, render, groupMeta, download, sendMedia, pic, markDirty: dirty,
+  return {attach, onOpen, whenReady, isReady: () => ready, active, send, edit, del, react, setReaction, markRead, setTyping, setOnline, openChat, render, groupMeta, download, sendMedia, pic, markDirty: dirty,
     getMessage: async(key) => findMsg(key)?.wa?.message, byId: (id) => msgs.find((m) => m.id === id)};
 };
  
