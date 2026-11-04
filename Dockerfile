@@ -24,6 +24,7 @@ RUN NODE_OPTIONS=--max-old-space-size=4096 npx vite build
 # WhatsApp login + message store + media cache live in /data: attach a Railway Volume mounted at /data (VOLUME instruction is not allowed on Railway)
 ENV WA_SESSIONS_DIR=/data/wa-sessions
 ENV WA_MEDIA_DIR=/data/wa-media
+ENV WA_PIC_DIR=/data/wa-pics
 
 EXPOSE 3000 8080
 ENTRYPOINT ["tini", "--"]
