@@ -815,6 +815,13 @@ export default class ReactionElement extends HTMLElement {
     if(reaction._ === 'reactionEmoji') {
       const availableReaction = apiManagerProxy.getReaction(reaction.emoticon);
       return callbackify(availableReaction, (availableReaction) => {
+        if(!availableReaction) {
+          // * no sticker assets (WhatsApp backend): show the emoji itself
+          this.stickerContainer.classList.add('is-static', 'is-plain-emoji');
+          this.stickerContainer.textContent = reaction.emoticon;
+          return;
+        }
+
         if(!availableReaction.center_icon) {
           this.stickerContainer.classList.add('is-static');
         } else {
