@@ -348,18 +348,21 @@ module.exports = function createBridge(ctx) {
     if(!rec || !sock) return;
     const jid = jidOfKey(key) || rec.jid;
     if(!jid) return;
-    let url;
-    try { url = await sock.profilePictureUrl(jid, 'preview', 20000); }
-    catch(e) {
-      if(picGone(e)) url = null;
-      else if(isRateLimit(e)) { picBackoffUntil = now() + 1800; log('picture queries rate limited, pausing 30 min'); picQueued.add(key); picQueue.unshift(key); return; }
-      else {
-        log(`picture ${jid} failed:`, e.message);
+    let url = null, gone = null;
+    // the same person can be known under a phone jid and a LID: WhatsApp answers differently for each, so try both
+    const alt = jid.endsWith('@s.whatsapp.net') ? Object.keys(reg.lidToPn).filter((l) => reg.lidToPn[l] === jid) : (reg.lidToPn[jid] ? [reg.lidToPn[jid]] : []);
+    for(const j of [jid, ...alt]) {
+      try { url = await sock.profilePictureUrl(j, 'preview', 20000); gone = null; if(url) break; }
+      catch(e) {
+        if(picGone(e)) { gone = e; continue; }
+        if(isRateLimit(e)) { picBackoffUntil = now() + 1800; log('picture queries rate limited, pausing 30 min'); picQueued.add(key); picQueue.unshift(key); return; }
+        log(`picture ${j} failed:`, e.message);
         rec.picTry = (rec.picTry || 0) + 1; // timeout etc: retry a few times with growing delay instead of waiting for the next reconnect
         if(rec.picTry <= 4) setTimeout(() => wantPic(key, key[0] === 'c', true), 30000 * rec.picTry).unref?.();
         return;
       }
     }
+    if(!url && key[0] === 'u') log(`picture ${jid}: ${gone ? 'hidden from us (' + (gone.data || gone.message) + ')' : 'none set'}`);
     const prev = rec.pic?.id || 0;
     if(key[0] === 'c') log(`group picture ${jid}: ${url ? 'found' : 'none/hidden'}`);
     rec.picTry = 0;
@@ -731,8 +734,13 @@ module.exports = function createBridge(ctx) {
       // Live ('notify') messages are announced even while ready=false (store.json was missing/unreadable after a restart):
       // otherwise a brand-new contact's message stays invisible until we answer him from the phone.
       const announced = (ready || type === 'notify') && !pendingIds.has(wm.key.id);
+      if(wm.key.fromMe && pendingIds.has(wm.key.id)) setPts(getPts() - 1); // echo of our own send arrived before the answer
       if(!wm.key.fromMe) log(`incoming ${wm.key.remoteJid} ${r.m.media ? r.m.media.type : 'text'} -> chat ${r.m.key} announced=${announced} ready=${ready}`);
       if(announced) announce(r.m);
+      if(!wm.key.fromMe && r.m.from !== SELF) {
+        const u = users.get(r.m.from);
+        if(u && (!u.pic || (!u.pic.id && now() - u.pic.at > 600))) wantPic('u' + r.m.from, true, true);
+      }
     }
     dirty();
   }
@@ -1051,6 +1059,7 @@ module.exports = function createBridge(ctx) {
       const r = ingest(sent || {key: {remoteJid: jid, fromMe: true, id}, status: 2, messageTimestamp: now(),
         message: w.mentions.length ? {extendedTextMessage: {text: w.text, contextInfo: {mentionedJid: w.mentions}}} : {conversation: w.text}});
       if(!r) throw fail(500, 'WA_SEND_FAILED');
+      if(!r.dup) setPts(getPts() - 1); // own send: delivered by the API answer, must not open a pts hole for the next push
       dirty();
       return r.m;
     } catch(e) {
@@ -1089,6 +1098,7 @@ module.exports = function createBridge(ctx) {
       const sent = await s.sendMessage(jid, content, {...opts, messageId: id});
       const r = sent && ingest(sent);
       if(!r) throw fail(500, 'WA_SEND_FAILED');
+      if(!r.dup) setPts(getPts() - 1); // own send: delivered by the API answer, must not open a pts hole for the next push
       dirty();
       return r.m;
     } catch(e) {
