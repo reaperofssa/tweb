@@ -560,12 +560,16 @@ module.exports = function createBridge(ctx) {
 
   /* ───────────────────────────── live events ───────────────────────────── */
 
-  function onUpsert({messages}) {
+  function onUpsert({messages, type}) {
     for(const wm of messages) {
       const r = ingest(wm);
-      if(!r || r.dup) continue;
-      // our own sends are announced by the API answer, not by their echo
-      if(ready && !pendingIds.has(wm.key.id)) announce(r.m);
+      if(!r || r.dup) { log(`upsert ${type} ${wm.key?.remoteJid} ${wm.key?.fromMe ? 'out' : 'in'}: ${r ? 'duplicate' : 'not a chat message / dropped'}`); continue; }
+      // our own sends are announced by the API answer, not by their echo.
+      // Live ('notify') messages are announced even while ready=false (store.json was missing/unreadable after a restart):
+      // otherwise a brand-new contact's message stays invisible until we answer him from the phone.
+      const announced = (ready || type === 'notify') && !pendingIds.has(wm.key.id);
+      if(!wm.key.fromMe) log(`incoming ${wm.key.remoteJid} ${r.m.media ? r.m.media.type : 'text'} -> chat ${r.m.key} announced=${announced} ready=${ready}`);
+      if(announced) announce(r.m);
     }
     dirty();
   }
