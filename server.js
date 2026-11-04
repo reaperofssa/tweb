@@ -155,7 +155,10 @@ function tlMedia(m) {
   if(!d) return null;
   const base = {id: String(m.id), access_hash: '1', file_reference: b64of(''), date: m.date, dc_id: 2};
   const r = d.w && d.h ? d.w / d.h : 1, tw = r >= 1 ? 100 : Math.round(100 * r), th = r >= 1 ? Math.round(100 / r) : 100;
-  const thumbs = d.thumb ? [{_: 'photoCachedSize', type: 'm', w: tw, h: th, bytes: b64of(d.thumb)}] : [];
+  // tweb only accepts a webp document as a sticker when it has thumbs (browsers that cannot encode webp: Safari, Firefox, most webviews) -> always give stickers one
+  const PIXEL = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+  const thumbs = d.thumb ? [{_: 'photoCachedSize', type: 'm', w: tw, h: th, bytes: b64of(d.thumb)}]
+    : d.type === 'sticker' ? [{_: 'photoCachedSize', type: 'm', w: 100, h: 100, bytes: b64of(PIXEL)}] : [];
   if(d.type === 'image') {
     return {_: 'messageMediaPhoto', pFlags: {}, photo: {_: 'photo', pFlags: {}, ...base,
       sizes: [...thumbs, {_: 'photoSize', type: 'x', w: d.w || 1280, h: d.h || 960, size: d.size || 100000}]}};
