@@ -220,7 +220,8 @@ export class AppReactionsManager extends AppManager {
         topReactions,
         quickReaction
       ], ([topReactions, quickReaction]) => {
-        const p: PeerAvailableReactions = {type: 'chatReactionsAll', reactions: topReactions};
+        // * WhatsApp has no custom emoji reactions: a fixed set, so no packs/search
+        const p: PeerAvailableReactions = {type: 'chatReactionsSome', reactions: topReactions, trulyAll: true};
         if(unshiftQuickReaction) {
           this.unshiftQuickReactionInner(p, quickReaction);
         }
