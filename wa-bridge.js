@@ -23,6 +23,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const REG_START = 100000; // registry ids; real phone numbers (>= 7 digits) are all above this
 const IDLE_MS = +process.env.WA_HISTORY_IDLE_MS || 5000; // history is "done" this long after the last chunk
@@ -32,6 +33,13 @@ const SAVE_DEBOUNCE_MS = 3000;
 const STATUS_READ = 4; // WAMessageStatus: ERROR 0, PENDING 1, SERVER_ACK 2, DELIVERY_ACK 3, READ 4, PLAYED 5
 const STUB_REVOKE = 1; // WAMessageStubType.REVOKE
 const WATCH_TTL_MS = 5 * 60 * 1000;
+// Telegram ids are numbers, WhatsApp ids are strings: ids are DERIVED from the JID, so they survive a lost store.json / registry.
+//   phone JID  -> the phone number (< 1e15)        LID JID -> LID_BASE + lid number (1e15 .. 2e15)
+//   group JID  -> GROUP_BASE + 40 bit hash of the JID (2e15 .. 2.002e15)   [all below 2^53]
+const LID_BASE = 1e15;
+const GROUP_BASE = 2e15;
+const GROUPS_TTL_S = +process.env.WA_GROUPS_TTL_S || 1800; // never call groupFetchAllParticipating more often than this (persisted, so crash loops do not spam it)
+const META_GAP_MS = 1500; // single-group metadata fetches are serialised with this gap
 
 module.exports = function createBridge(ctx) {
   const {users, groups, msgs, readState, SELF, push, updatesOf, tlMessage, tlChat, tlUser, addMessage,
@@ -49,6 +57,8 @@ module.exports = function createBridge(ctx) {
   const chatUnread = {}; // peerKey -> unread count told by WhatsApp (history)
   const pendingIds = new Set(); // ids of messages we are sending (their echo must not be pushed twice)
   const watched = new Map(); // jid -> when presence was subscribed
+  const metaCache = new Map(); // group jid -> latest Baileys GroupMetadata (handed back to Baileys through cachedGroupMetadata)
+  let metaChain = Promise.resolve(), metaBackoffUntil = 0;
 
   function freshReg() {
     return {next: REG_START, byJid: {}, jidById: {}, lidToPn: {}, self: {phones: [], lids: []}};
@@ -73,13 +83,17 @@ module.exports = function createBridge(ctx) {
 
   const isSelfUser = (user) => reg.self.phones.includes(user) || reg.self.lids.includes(user);
 
+  const hashId = (jid) => GROUP_BASE + crypto.createHash('sha1').update(jid).digest().readUIntBE(0, 5);
+
   function idOf(jid) {
     jid = norm(jid);
     const [user, server] = jid.split('@');
     if(isSelfUser(user)) return SELF;
-    if(reg.byJid[jid]) return reg.byJid[jid];
+    if(reg.byJid[jid]) return reg.byJid[jid]; // ids handed out by older versions stay as they are
     if(server === 's.whatsapp.net' && /^\d{7,15}$/.test(user)) return Number(user);
-    const id = reg.next++;
+    let id;
+    if(server === 'lid' && /^\d{1,15}$/.test(user)) id = LID_BASE + Number(user);
+    else { id = hashId(jid); while(reg.jidById[id] && reg.jidById[id] !== jid) id++; }
     reg.byJid[jid] = id;
     reg.jidById[id] = jid;
     return id;
@@ -164,7 +178,7 @@ module.exports = function createBridge(ctx) {
     const [user, server] = jid.split('@');
     let u = users.get(id);
     if(!u) {
-      u = {first_name: '', last_name: '', phone: server === 's.whatsapp.net' ? user : '', rank: -1, contact: false};
+      u = {first_name: '', last_name: '', phone: server === 's.whatsapp.net' ? user : '', rank: -1, contact: false, ...(server !== 's.whatsapp.net' && {jid})};
       users.set(id, u);
     }
     if(name && rank > u.rank) { u.first_name = String(name); u.last_name = ''; u.rank = rank; }
@@ -221,6 +235,7 @@ module.exports = function createBridge(ctx) {
   function upsertGroupMeta(meta) {
     if(!meta?.id) return;
     const id = ensureGroup(meta.id, meta.subject);
+    metaCache.set(norm(meta.id), meta);
     const g = groups.get(id), members = new Set([SELF]);
     g.announce = !!meta.announce;
     g.selfAdmin = false;
@@ -236,20 +251,101 @@ module.exports = function createBridge(ctx) {
     if(ready) push({_: 'updates', updates: [{_: 'updateChat', chat_id: id}], users: [], chats: [tlChat(id)], date: now(), seq: 0});
   }
 
-  async function refreshGroups() {
-    if(!sock || now() - groupsAt < 300) return;
-    groupsAt = now();
+  const isRateLimit = (e) => /rate|overlimit|429|too many/i.test(String(e?.message || e) + String(e?.data || ''));
+
+  /** ONE call for every group. Persisted TTL: a crash loop / reconnect storm must not hammer WhatsApp's participants endpoint. */
+  async function refreshGroups(force) {
+    if(!sock || now() < metaBackoffUntil) return;
+    if(!force && groups.size && now() - (reg.groupsAt || 0) < GROUPS_TTL_S) return;
+    reg.groupsAt = now();
+    dirty();
     try {
       const all = await sock.groupFetchAllParticipating();
       for(const meta of Object.values(all || {})) upsertGroupMeta(meta);
       log(`groups: ${Object.keys(all || {}).length}`);
       dirty();
-    } catch(e) { log('groupFetchAllParticipating failed:', e.message); }
+    } catch(e) {
+      log('groupFetchAllParticipating failed:', e.message);
+      if(isRateLimit(e)) metaBackoffUntil = now() + 3600;
+    }
   }
+
+  /** one group, queued (1 per META_GAP_MS), cached, never while backing off */
+  function fetchMeta(jid) {
+    jid = norm(jid);
+    if(metaCache.has(jid)) return Promise.resolve(metaCache.get(jid));
+    const run = async() => {
+      if(metaCache.has(jid)) return metaCache.get(jid);
+      if(!sock || now() < metaBackoffUntil) return undefined;
+      try {
+        const meta = await sock.groupMetadata(jid);
+        upsertGroupMeta(meta);
+        return meta;
+      } catch(e) {
+        log(`groupMetadata ${jid} failed:`, e.message);
+        if(isRateLimit(e)) metaBackoffUntil = now() + 3600;
+        return undefined;
+      } finally { await new Promise((r) => setTimeout(r, META_GAP_MS)); }
+    };
+    const p = metaChain.then(run, run);
+    metaChain = p.catch(() => {});
+    return p;
+  }
+
+  /** Baileys asks this before every group send / receive instead of hitting WhatsApp */
+  const groupMeta = (jid) => metaCache.get(norm(jid)) || fetchMeta(jid);
 
   /* ───────────────────────────── message content ───────────────────────────── */
 
   const unwrap = (message) => (B?.normalizeMessageContent ? B.normalizeMessageContent(message) : message);
+
+  /* ───────────────────────────── media ───────────────────────────── */
+  const MEDIA_KEYS = {imageMessage: 'image', videoMessage: 'video', ptvMessage: 'video', audioMessage: 'audio', documentMessage: 'document', stickerMessage: 'sticker'};
+  const num = (v) => Number(v?.toNumber ? v.toNumber() : v) || 0;
+  const b64 = (v) => (v && v.length ? Buffer.from(v).toString('base64') : undefined);
+  const MEDIA_DIR = process.env.WA_MEDIA_DIR || path.join(__dirname, 'wa-media');
+  const noLog = {level: 'silent', info() {}, debug() {}, warn() {}, error() {}, trace() {}, fatal() {}, child() { return noLog; }};
+
+  /** JSON-safe description of a WhatsApp media message (enough to rebuild it for downloadMediaMessage after a restart) */
+  function mediaOf(message) {
+    const c = unwrap(message);
+    if(!c) return undefined;
+    for(const k of Object.keys(MEDIA_KEYS)) {
+      const x = c[k];
+      if(!x) continue;
+      return {
+        type: MEDIA_KEYS[k], key: k, mime: x.mimetype || '', size: num(x.fileLength), w: x.width || 0, h: x.height || 0, dur: x.seconds || 0,
+        ptt: !!x.ptt, anim: !!(x.gifPlayback || x.isAnimated), round: k === 'ptvMessage', name: x.fileName || '', caption: x.caption || '',
+        thumb: b64(x.jpegThumbnail), wave: b64(x.waveform),
+        raw: {url: x.url, directPath: x.directPath, mediaKey: b64(x.mediaKey), fileSha256: b64(x.fileSha256), fileEncSha256: b64(x.fileEncSha256), fileLength: num(x.fileLength), mimetype: x.mimetype}
+      };
+    }
+    return undefined;
+  }
+
+  const dlInflight = new Map();
+  /** the media bytes of a message: disk cache first, else decrypt from WhatsApp (and ask the phone to re-upload if the link expired) */
+  function download(m) {
+    const md = m?.media;
+    if(!md) return Promise.resolve(null);
+    const file = path.join(MEDIA_DIR, `${m.key}-${m.waId || m.id}.bin`.replace(/[^\w.-]/g, '_'));
+    if(dlInflight.has(file)) return dlInflight.get(file);
+    const job = (async() => {
+      try { return await fs.promises.readFile(file); } catch {}
+      const s = requireSock(), r = md.raw, un = (v) => (v ? Buffer.from(v, 'base64') : undefined);
+      const wm = {key: m.wa?.key || {remoteJid: m.jid, id: m.waId, fromMe: !!m.out},
+        message: {[md.key]: {url: r.url, directPath: r.directPath, mediaKey: un(r.mediaKey), fileSha256: un(r.fileSha256), fileEncSha256: un(r.fileEncSha256), fileLength: r.fileLength, mimetype: r.mimetype}}};
+      let buf;
+      try { buf = await B.downloadMediaMessage(wm, 'buffer', {}, {logger: noLog, reuploadRequest: s.updateMediaMessage}); } catch(e) {
+        log('media download failed:', m.id, e.message);
+        throw fail(500, 'WA_MEDIA_UNAVAILABLE', e.message);
+      }
+      try { await fs.promises.mkdir(MEDIA_DIR, {recursive: true}); await fs.promises.writeFile(file, buf); } catch(e) { log('media cache write failed:', e.message); }
+      return buf;
+    })().finally(() => dlInflight.delete(file));
+    dlInflight.set(file, job);
+    return job;
+  }
 
   /** text shown in the chat for a WhatsApp message; null = not a chat message (protocol, key distribution, ...) */
   function describe(message) {
@@ -309,6 +405,14 @@ module.exports = function createBridge(ctx) {
   }
 
   const mentionsOf = (message) => mentionPairs(contextOf(message)?.mentionedJid);
+
+  /** Telegram's `mentioned`: I am tagged, or someone replied to one of my messages (groups only, like Telegram) */
+  function mentionsMeOf(message) {
+    const c = contextOf(message);
+    if(!c) return false;
+    if((c.mentionedJid || []).some((j) => typeof j === 'string' && isSelfUser(userPart(j)))) return true;
+    return !!(c.quotedMessage && c.participant && isSelfUser(userPart(c.participant)));
+  }
 
   function displayName(id) {
     const u = users.get(id);
@@ -373,6 +477,7 @@ module.exports = function createBridge(ctx) {
       const cid = ensureGroup(chatJid);
       peerKey = 'c' + cid;
       addMember(cid, from);
+      if(ready && !metaCache.has(chatJid)) fetchMeta(chatJid);
     } else {
       peerKey = 'u' + ensureUser(chatJid, null);
     }
@@ -380,9 +485,12 @@ module.exports = function createBridge(ctx) {
     const ctxInfo = contextOf(wm.message);
     const replyWaId = ctxInfo?.stanzaId;
     const replied = replyWaId && byWaId.get(waKeyOf(chatJid, replyWaId));
-    const m = addMessage(peerKey, from, d.text, tsOf(wm.messageTimestamp), {
+    const media = mediaOf(wm.message);
+    const m = addMessage(peerKey, from, media ? media.caption : d.text, tsOf(wm.messageTimestamp), {
+      ...(media && {media}),
       reply_to: replied ? replied.id : undefined,
       replyWaId, jid: chatJid, waId: key.id, kind: d.kind, wstatus: wm.status, mentions: mentionsOf(wm.message),
+      ...(isGroup && !key.fromMe && mentionsMeOf(wm.message) && {mentionsMe: true}),
       wa: {key: {...key}, message: wm.message}
     });
     byWaId.set(waKeyOf(chatJid, key.id), m);
@@ -479,6 +587,7 @@ module.exports = function createBridge(ctx) {
         if(d) {
           m.text = d.text;
           m.mentions = mentionsOf(edited);
+          if(m.key[0] === 'c' && !m.out) m.mentionsMe = mentionsMeOf(edited) || undefined;
           m.edit_date = now();
           if(m.wa) m.wa.message = edited;
           bumpPts();
@@ -593,6 +702,8 @@ module.exports = function createBridge(ctx) {
       for(const meta of l) {
         if(!meta.id) continue;
         const id = ensureGroup(meta.id, meta.subject), g = groups.get(id);
+        const cached = metaCache.get(norm(meta.id));
+        if(cached) Object.assign(cached, Object.fromEntries(Object.entries(meta).filter(([k, v]) => v != null && k !== 'participants')));
         if(typeof meta.announce === 'boolean' && g.announce !== meta.announce) {
           g.announce = meta.announce;
           if(ready) push({_: 'updates', updates: [{_: 'updateChat', chat_id: id}], users: [], chats: [tlChat(id)], date: now(), seq: 0});
@@ -602,6 +713,14 @@ module.exports = function createBridge(ctx) {
     });
     safe('group-participants.update', ({id, participants, action}) => {
       const cid = ensureGroup(id);
+      const cached = metaCache.get(norm(id));
+      if(cached) {
+        const raw = (participants || []).map((p) => (typeof p === 'string' ? {id: p} : p));
+        const has = new Set((cached.participants || []).map((x) => x.id));
+        if(action === 'add') cached.participants = [...(cached.participants || []), ...raw.filter((p) => !has.has(p.id))];
+        else if(action === 'remove') cached.participants = (cached.participants || []).filter((x) => !raw.some((p) => p.id === x.id));
+        else if(action === 'promote' || action === 'demote') for(const x of cached.participants || []) if(raw.some((p) => p.id === x.id)) x.admin = action === 'promote' ? 'admin' : null;
+      }
       for(const p of participants || []) {
         const uid = ensureUser(norm(p.phoneNumber || p.id || p), p.name || p.notify, NAME_RANK.notify);
         if(action === 'add') addMember(cid, uid);
@@ -661,7 +780,8 @@ module.exports = function createBridge(ctx) {
       const s = JSON.parse(raw, B?.BufferJSON?.reviver);
       reg = {...freshReg(), ...s.reg};
       for(const [id, u] of s.users || []) users.set(+id, u);
-      for(const [id, g] of s.groups || []) groups.set(+id, g);
+      for(const [id, g] of s.groups || []) { groups.set(+id, g); if(g.jid) reg.jidById[+id] ||= g.jid; }
+      for(const [id, u] of users) if(u.jid) reg.jidById[id] ||= u.jid;
       msgs.push(...(s.msgs || []));
       Object.assign(readState, s.readState || {});
       for(const m of msgs) if(m.waId && m.jid) byWaId.set(waKeyOf(m.jid, m.waId), m);
@@ -698,6 +818,7 @@ module.exports = function createBridge(ctx) {
   }
 
   process.on('exit', save);
+  for(const sig of ['SIGTERM', 'SIGINT']) process.once(sig, () => { save(); process.exit(0); });
 
   /* ───────────────────────────── tweb -> WhatsApp ───────────────────────────── */
 
@@ -773,6 +894,42 @@ module.exports = function createBridge(ctx) {
     }
   }
 
+  /** upload from tweb (inputMediaUploadedPhoto / inputMediaUploadedDocument) -> WhatsApp message */
+  async function sendMedia(peerKey, p, buf) {
+    const s = requireSock();
+    const jid = jidOfKey(peerKey);
+    if(!jid) throw fail(400, 'PEER_ID_INVALID');
+    const im = p.media || {}, attrs = im.attributes || [], at = (n) => attrs.find((a) => a._ === n);
+    const w = toWaText(p.message || '', p.entities), caption = w.text || undefined;
+    let content;
+    if(im._ === 'inputMediaUploadedPhoto') content = {image: buf, caption};
+    else if(im._ === 'inputMediaUploadedDocument') {
+      const mime = im.mime_type || 'application/octet-stream', audio = at('documentAttributeAudio'), video = at('documentAttributeVideo');
+      if(at('documentAttributeSticker') || mime === 'image/webp') content = {sticker: buf};
+      else if(audio?.pFlags?.voice || audio?.voice) content = {audio: buf, ptt: true, mimetype: 'audio/ogg; codecs=opus'};
+      else if(audio) content = {audio: buf, mimetype: mime};
+      else if(video && !im.pFlags?.force_file) content = {video: buf, caption, mimetype: mime, ...(at('documentAttributeAnimated') && {gifPlayback: true}), ...(video.pFlags?.round_message && {ptv: true})};
+      else if(mime.startsWith('image/') && !im.pFlags?.force_file && !at('documentAttributeFilename')) content = {image: buf, caption};
+      else content = {document: buf, mimetype: mime, fileName: at('documentAttributeFilename')?.file_name || 'file', caption};
+    } else throw fail(400, 'MEDIA_INVALID');
+    if(w.mentions.length) content.mentions = w.mentions;
+    const opts = {}, replyId = p.reply_to?.reply_to_msg_id;
+    if(replyId) { const q = msgs.find((m) => m.id === replyId); if(q?.wa) opts.quoted = {key: q.wa.key, message: q.wa.message}; }
+    const id = B.generateMessageIDV2 ? B.generateMessageIDV2(s.user?.id) : B.generateMessageID();
+    pendingIds.add(id);
+    try {
+      const sent = await s.sendMessage(jid, content, {...opts, messageId: id});
+      const r = sent && ingest(sent);
+      if(!r) throw fail(500, 'WA_SEND_FAILED');
+      dirty();
+      return r.m;
+    } catch(e) {
+      if(e.type) throw e;
+      log('sendMedia failed:', e.message);
+      throw fail(500, 'WA_SEND_FAILED', e.message);
+    } finally { setTimeout(() => pendingIds.delete(id), 30000).unref?.(); }
+  }
+
   async function edit(m, text, entities) {
     const s = requireSock();
     if(!m.wa || !m.out) throw fail(400, 'MESSAGE_EDIT_FORBIDDEN');
@@ -824,7 +981,7 @@ module.exports = function createBridge(ctx) {
     if(active() && peerKey[0] === 'u' && +peerKey.slice(1) !== SELF) watch(jidOfKey(peerKey));
   }
 
-  return {attach, onOpen, whenReady, isReady: () => ready, active, send, edit, del, markRead, setTyping, setOnline, openChat, render,
+  return {attach, onOpen, whenReady, isReady: () => ready, active, send, edit, del, markRead, setTyping, setOnline, openChat, render, groupMeta, download, sendMedia, markDirty: dirty,
     getMessage: async(key) => findMsg(key)?.wa?.message, byId: (id) => msgs.find((m) => m.id === id)};
 };
  

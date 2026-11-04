@@ -146,14 +146,39 @@ const msgBody = (m) => {
   const r = m.mentions?.length && renderMentions ? renderMentions(m) : null;
   return r ? {message: r.text, ...(r.entities.length && {entities: r.entities})} : {message: m.text};
 };
-const tlMessage = (m) => m.action ? tlService(m) : ({_: 'message', pFlags: flags({out: m.out}), id: m.id, from_id: {_: 'peerUser', user_id: m.from},
-  peer_id: peerOf(m.key), date: m.date, ...msgBody(m), ...(m.edit_date && {edit_date: m.edit_date}),
+// Telegram "@" button: a message is an unread mention while it tags me (or replies to me) in a group and neither the chat nor the mention was read
+const isUnreadMention = (m) => !!m.mentionsMe && !m.out && !m.mentionRead && m.id > (readState[m.key]?.inbox || 0);
+// -- WhatsApp media -> Telegram photo / document objects (bytes are fetched lazily by upload.getFile)
+const b64of = (v) => ({__b64: v || ''});
+function tlMedia(m) {
+  const d = m.media;
+  if(!d) return null;
+  const base = {id: String(m.id), access_hash: '1', file_reference: b64of(''), date: m.date, dc_id: 2};
+  const r = d.w && d.h ? d.w / d.h : 1, tw = r >= 1 ? 100 : Math.round(100 * r), th = r >= 1 ? Math.round(100 / r) : 100;
+  const thumbs = d.thumb ? [{_: 'photoCachedSize', type: 'm', w: tw, h: th, bytes: b64of(d.thumb)}] : [];
+  if(d.type === 'image') {
+    return {_: 'messageMediaPhoto', pFlags: {}, photo: {_: 'photo', pFlags: {}, ...base,
+      sizes: [...thumbs, {_: 'photoSize', type: 'x', w: d.w || 1280, h: d.h || 960, size: d.size || 100000}]}};
+  }
+  const attrs = [];
+  if(d.type === 'sticker') attrs.push({_: 'documentAttributeImageSize', w: d.w || 512, h: d.h || 512}, {_: 'documentAttributeSticker', pFlags: {}, alt: '', stickerset: {_: 'inputStickerSetEmpty'}});
+  else if(d.type === 'video') {
+    attrs.push({_: 'documentAttributeVideo', pFlags: flags({round_message: d.round}), duration: d.dur || 0, w: d.w || 640, h: d.h || 480});
+    if(d.anim) attrs.push({_: 'documentAttributeAnimated'});
+  } else if(d.type === 'audio') attrs.push({_: 'documentAttributeAudio', pFlags: flags({voice: d.ptt}), duration: d.dur || 0, ...(d.wave && {waveform: b64of(d.wave)})});
+  if(d.type === 'document' || d.name) attrs.push({_: 'documentAttributeFilename', file_name: d.name || 'file'});
+  return {_: 'messageMediaDocument', pFlags: flags({video: d.type === 'video' && !d.anim, round: d.round, voice: d.ptt}),
+    document: {_: 'document', pFlags: {}, ...base, mime_type: d.mime || 'application/octet-stream', size: d.size || 0,
+      ...(thumbs.length && {thumbs}), attributes: attrs}};
+}
+const tlMessage = (m) => m.action ? tlService(m) : ({_: 'message', pFlags: flags({out: m.out, mentioned: m.mentionsMe && !m.out, media_unread: isUnreadMention(m)}), id: m.id, from_id: {_: 'peerUser', user_id: m.from},
+  peer_id: peerOf(m.key), date: m.date, ...msgBody(m), ...(m.media && {media: tlMedia(m)}), ...(m.edit_date && {edit_date: m.edit_date}),
   ...(m.reply_to && {reply_to: {_: 'messageReplyHeader', pFlags: {}, reply_to_msg_id: m.reply_to}})});
 const tlDialog = (key) => {
   const list = msgsOf(key), top = list[list.length - 1], rs = readState[key] || (readState[key] = {inbox: 0, outbox: 0});
   return {_: 'dialog', pFlags: {}, peer: peerOf(key), top_message: top ? top.id : 0, read_inbox_max_id: rs.inbox,
     read_outbox_max_id: rs.outbox, unread_count: list.filter((m) => !m.out && m.id > rs.inbox).length,
-    unread_mentions_count: 0, unread_reactions_count: 0, unread_poll_votes_count: 0,
+    unread_mentions_count: list.filter(isUnreadMention).length, unread_reactions_count: 0, unread_poll_votes_count: 0,
     notify_settings: {_: 'peerNotifySettings', pFlags: {}}};
 };
 const state = () => ({_: 'updates.state', pts, qts: 0, date: now(), seq: 0, unread_count: 0});
@@ -225,6 +250,7 @@ WA.init({
   onOpen: (entry) => { applyWaUser(entry); bridge.onOpen(entry); },
   onSocket: (entry, sock, baileys) => bridge.attach(entry, sock, baileys),
   getMessage: (key) => bridge.getMessage(key),
+  cachedGroupMetadata: (jid) => bridge.groupMeta(jid),
   onLogout: () => log('WhatsApp session logged out from the phone')
 });
 const waAuthorization = () => ({_: 'auth.authorization', pFlags: {}, user: tlUser(SELF)});
@@ -341,6 +367,34 @@ H['messages.readHistory'] = (p) => {
   rs.inbox = Math.max(rs.inbox, p.max_id || lastId);
   return {_: 'messages.affectedMessages', pts: ++pts, pts_count: 1};
 };
+// -- "@" button (tags / replies to me)
+// TL paging: newest first; offset_id = start after this id, add_offset shifts the window (tweb sends -50 to also get the ones above the offset)
+const tlWindow = (desc, p) => {
+  const i = p.offset_id > 0 ? desc.findIndex((m) => m.id < p.offset_id) : 0, at = i < 0 ? desc.length : i;
+  const start = Math.max(0, at + (p.add_offset || 0));
+  return desc.slice(start, start + (p.limit || 20));
+};
+H['messages.getUnreadMentions'] = (p) => {
+  const key = peerKeyOf(p.peer);
+  let list = key ? msgsOf(key).filter(isUnreadMention) : [];
+  if(p.max_id > 0) list = list.filter((m) => m.id < p.max_id);
+  if(p.min_id > 0) list = list.filter((m) => m.id > p.min_id);
+  const page = tlWindow([...list].reverse(), p);
+  return {_: 'messages.messagesSlice', pFlags: {}, count: list.length, messages: page.map(tlMessage), topics: [], ...entities(page, key ? [key] : [])};
+};
+H['messages.readMentions'] = (p) => {
+  const key = peerKeyOf(p.peer);
+  for(const m of key ? msgsOf(key) : []) if(isUnreadMention(m)) m.mentionRead = true;
+  bridge.markDirty();
+  return {_: 'messages.affectedHistory', pts: ++pts, pts_count: 1, offset: 0};
+};
+H['messages.readMessageContents'] = (p) => {
+  const ids = new Set(p.id || []);
+  for(const m of msgs) if(ids.has(m.id) && m.mentionsMe) m.mentionRead = true;
+  bridge.markDirty();
+  return {_: 'messages.affectedMessages', pts: ++pts, pts_count: (p.id || []).length};
+};
+H['messages.getUnreadReactions'] = () => noMsgs();
 H['messages.setTyping'] = (p) => { const key = peerKeyOf(p.peer); if(key) bridge.setTyping(key, p.action); return true; };
 H['messages.getAllDrafts'] = () => updatesOf([]);
 
@@ -443,9 +497,11 @@ H['messages.getFullChat'] = (p) => {
 // -- search (real, over the in-memory store). Media filters return nothing: only text exists for now.
 const isMediaFilter = (f) => f && f._ !== 'inputMessagesFilterEmpty' && f._ !== 'inputMessagesFilterUrl';
 function searchMsgs(p, key) {
-  if(isMediaFilter(p.filter)) return [];
+  const mine = p.filter?._ === 'inputMessagesFilterMyMentions';
+  if(!mine && isMediaFilter(p.filter)) return [];
   const q = (p.q || '').toLowerCase();
   let list = key ? msgsOf(key) : msgs;
+  if(mine) list = list.filter((m) => m.mentionsMe && !m.out);
   if(q) list = list.filter((m) => m.text.toLowerCase().includes(q));
   if(p.filter?._ === 'inputMessagesFilterUrl') list = list.filter((m) => /https?:\/\//.test(m.text));
   if(p.from_id) { const f = peerKeyOf(p.from_id); if(f) list = list.filter((m) => 'u' + m.from === f); }
@@ -468,7 +524,7 @@ H['messages.search'] = (p) => {
 };
 H['messages.searchGlobal'] = (p) => searchResult(searchMsgs(p, null), {...p, add_offset: 0});
 H['messages.getSearchCounters'] = (p) => p.filters.map((f) => ({_: 'messages.searchCounter', pFlags: {},
-  filter: f, count: f._ === 'inputMessagesFilterEmpty' ? msgsOf(peerKeyOf(p.peer)).length : 0}));
+  filter: f, count: f._ === 'inputMessagesFilterEmpty' ? msgsOf(peerKeyOf(p.peer)).length : f._ === 'inputMessagesFilterMyMentions' ? msgsOf(peerKeyOf(p.peer)).filter((m) => m.mentionsMe && !m.out).length : 0}));
 
 // -- stories / payments / misc new APIs
 H['stories.getAllStories'] = () => ({_: 'stories.allStories', pFlags: {}, count: 0, state: '', peer_stories: [], chats: [], users: [],
@@ -623,6 +679,47 @@ H['upload.getFile'] = (p) => {
   const bytes = stickerBytes.get(String(p.location?.id)) || new Uint8Array(0);
   const off = p.offset || 0;
   return {_: 'upload.file', type: {_: 'storage.fileWebp'}, mtime: now(), bytes: bytes.subarray(off, off + (p.limit || bytes.length))};
+};
+
+// -- WhatsApp media: download (lazy, cached on disk) ...
+const prevGetFile = H['upload.getFile'];
+const storageOf = (mime = '') => ({_: mime.startsWith('image/jpeg') ? 'storage.fileJpeg' : mime === 'image/png' ? 'storage.filePng' : mime === 'image/webp' ? 'storage.fileWebp'
+  : mime === 'video/mp4' ? 'storage.fileMp4' : mime === 'audio/mpeg' ? 'storage.fileMp3' : mime === 'application/pdf' ? 'storage.filePdf' : 'storage.fileUnknown'});
+H['upload.getFile'] = async(p) => {
+  const loc = p.location || {}, id = String(loc.id ?? '');
+  const m = loc._ && /^input(Photo|Document)FileLocation$/.test(loc._) && !stickerBytes.has(id) ? msgs.find((x) => x.media && String(x.id) === id) : null;
+  if(!m) return prevGetFile(p);
+  let buf, mime = m.media.mime;
+  if(loc.thumb_size === 'm' && m.media.thumb) { buf = Buffer.from(m.media.thumb, 'base64'); mime = 'image/jpeg'; } else buf = await bridge.download(m);
+  if(!buf) throw fail(400, 'FILE_REFERENCE_INVALID');
+  const off = p.offset || 0, lim = p.limit || buf.length;
+  return {_: 'upload.file', type: storageOf(m.media.type === 'image' ? 'image/jpeg' : mime), mtime: m.date, bytes: new Uint8Array(buf.buffer, buf.byteOffset + off, Math.max(0, Math.min(lim, buf.length - off)))};
+};
+
+// -- ... and upload (tweb sends parts, then references the file id in messages.sendMedia)
+const uploads = new Map(); // file_id -> {parts: Map(part -> Buffer), t}
+const toBuf = (b) => (b && b.__b64 !== undefined ? Buffer.from(b.__b64, 'base64') : Buffer.from(b || []));
+H['upload.saveFilePart'] = H['upload.saveBigFilePart'] = (p) => {
+  const k = String(p.file_id);
+  let u = uploads.get(k);
+  if(!u) { u = {parts: new Map(), t: Date.now()}; uploads.set(k, u); }
+  u.parts.set(p.file_part, toBuf(p.bytes));
+  for(const [id, x] of uploads) if(Date.now() - x.t > 30 * 60 * 1000) uploads.delete(id); // abandoned uploads
+  return true;
+};
+const takeUpload = (file) => {
+  const u = file && uploads.get(String(file.id));
+  if(!u) throw fail(400, 'FILE_ID_INVALID');
+  uploads.delete(String(file.id));
+  return Buffer.concat([...u.parts.keys()].sort((a, b) => a - b).map((i) => u.parts.get(i)));
+};
+H['messages.sendMedia'] = async(p) => {
+  const key = peerKeyOf(p.peer);
+  if(!key) throw fail(400, 'PEER_ID_INVALID');
+  if(!bridge.active()) throw fail(400, 'WA_NOT_CONNECTED');
+  const wm = await bridge.sendMedia(key, p, takeUpload(p.media?.file));
+  return updatesOf([{_: 'updateMessageID', id: wm.id, random_id: p.random_id},
+    {_: 'updateNewMessage', message: tlMessage(wm), pts, pts_count: 1}], [wm]);
 };
 
 /* ── emoji statuses (premium) ── */

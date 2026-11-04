@@ -34,7 +34,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let injected = null; // tests can pass a fake baileys module through init({baileys})
 let B = null;
-let hooks = {onOpen() {}, onLogout() {}, onSocket() {}, getMessage: async() => undefined};
+let hooks = {onOpen() {}, onLogout() {}, onSocket() {}, getMessage: async() => undefined, cachedGroupMetadata: async() => undefined};
 const entries = new Map(); // hash -> entry
 let active = null; // the entry whose socket is open
 
@@ -77,7 +77,8 @@ async function connect(entry) {
     browser: b.Browsers.ubuntu('Chrome'), // same as sano; pairing codes need a desktop-browser identity
     markOnlineOnConnect: false, // a chat client should not silence the phone's notifications
     syncFullHistory: process.env.WA_FULL_HISTORY === '1',
-    getMessage: (key) => Promise.resolve(hooks.getMessage(key)).catch(() => undefined)
+    getMessage: (key) => Promise.resolve(hooks.getMessage(key)).catch(() => undefined),
+    cachedGroupMetadata: (jid) => Promise.resolve(hooks.cachedGroupMetadata(jid)).catch(() => undefined) // no groupMetadata call per group message
   });
   entry.sock = sock;
   entry.ready = false;
