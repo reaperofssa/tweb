@@ -29,7 +29,10 @@ const REG_START = 100000; // registry ids; real phone numbers (>= 7 digits) are 
 const IDLE_MS = +process.env.WA_HISTORY_IDLE_MS || 5000; // history is "done" this long after the last chunk
 const FIRST_CHUNK_MS = +process.env.WA_HISTORY_FIRST_MS || 15000; // ... or this long after open if none came
 const MAX_WAIT_MS = +process.env.WA_HISTORY_MAX_MS || 45000;
-const SAVE_DEBOUNCE_MS = 3000;
+const SAVE_DEBOUNCE_MS = +process.env.WA_SAVE_MS || 1500; // at most this long between a change and it being on disk (throttle, not a debounce: constant traffic must not starve the save)
+const SEND_WAIT_MS = +process.env.WA_SEND_WAIT_MS || 20000; // a send issued while WhatsApp is reconnecting waits this long instead of failing
+const SEND_ATTEMPTS = 3;
+const STUB_CIPHERTEXT = 2; // WAMessageStubType.CIPHERTEXT: Baileys could not decrypt it (yet); WhatsApp re-sends it after a retry request
 const STATUS_READ = 4; // WAMessageStatus: ERROR 0, PENDING 1, SERVER_ACK 2, DELIVERY_ACK 3, READ 4, PLAYED 5
 const STUB_REVOKE = 1; // WAMessageStubType.REVOKE
 const WATCH_TTL_MS = 5 * 60 * 1000;
@@ -512,6 +515,9 @@ module.exports = function createBridge(ctx) {
     return job;
   }
 
+  const NOT_CHAT = new Set(['protocolMessage', 'senderKeyDistributionMessage', 'reactionMessage', 'encReactionMessage', 'pollUpdateMessage', 'messageContextInfo',
+    'keepInChatMessage', 'pinInChatMessage', 'albumMessage', 'editedMessage', 'encEventResponseMessage', 'secretEncryptedMessage', 'statusMentionMessage', 'messageHistoryBundle']);
+
   /** text shown in the chat for a WhatsApp message; null = not a chat message (protocol, key distribution, ...) */
   function describe(message) {
     const c = unwrap(message);
@@ -531,10 +537,20 @@ module.exports = function createBridge(ctx) {
       const p = c.pollCreationMessage || c.pollCreationMessageV2 || c.pollCreationMessageV3;
       return {text: '📊 ' + (p.name || 'Poll'), kind: 'poll'};
     }
+    if(c.groupInviteMessage) return {text: '👥 Group invite: ' + (c.groupInviteMessage.groupName || 'group') + (c.groupInviteMessage.caption ? '\n' + c.groupInviteMessage.caption : ''), kind: 'text'};
+    if(c.eventMessage) return {text: '📅 ' + (c.eventMessage.name || 'Event'), kind: 'text'};
+    if(c.productMessage) return {text: '🛍 ' + (c.productMessage.product?.title || 'Product'), kind: 'text'};
+    if(c.buttonsMessage) return {text: c.buttonsMessage.contentText || c.buttonsMessage.text || '(buttons)', kind: 'text'};
+    if(c.listMessage) return {text: [c.listMessage.title, c.listMessage.description].filter(Boolean).join('\n') || '(list)', kind: 'text'};
+    if(c.templateMessage) { const t = c.templateMessage.hydratedTemplate || c.templateMessage.hydratedFourRowTemplate || {}; return {text: t.hydratedContentText || t.hydratedTitleText || '(template)', kind: 'text'}; }
+    if(c.interactiveMessage) return {text: c.interactiveMessage.body?.text || c.interactiveMessage.header?.title || '(interactive message)', kind: 'text'};
     if(c.buttonsResponseMessage) return {text: c.buttonsResponseMessage.selectedDisplayText || '', kind: 'text'};
     if(c.listResponseMessage) return {text: c.listResponseMessage.title || '', kind: 'text'};
     if(c.templateButtonReplyMessage) return {text: c.templateButtonReplyMessage.selectedDisplayText || '', kind: 'text'};
-    return null;
+    // Anything else that carries content must not vanish silently ("I am missing messages"): show a placeholder.
+    // Protocol-level / bookkeeping messages are not chat messages and stay hidden.
+    const k = Object.keys(c).find((x) => c[x] && !NOT_CHAT.has(x));
+    return k ? {text: '⚠️ Unsupported message (' + k.replace(/Message(V\d+)?$/, '') + ') - open it on your phone', kind: 'text'} : null;
   }
 
   const contextOf = (message) => {
@@ -625,10 +641,28 @@ module.exports = function createBridge(ctx) {
     const chatJid = chatJidOfKey(key), kind = kindOf(chatJid);
     if(!kind) return null; // status@broadcast, newsletters, broadcast lists
     const known = byWaId.get(waKeyOf(chatJid, key.id));
-    if(known) return {m: known, dup: true};
+    const undecryptable = !wm.message && wm.messageStubType === STUB_CIPHERTEXT;
+    if(known) {
+      // WhatsApp re-sent a message we could only show as "waiting": fill the placeholder in instead of ignoring the real one
+      const real = known.pending && !undecryptable && describe(wm.message);
+      if(!real) return {m: known, dup: true};
+      const media = mediaOf(wm.message), ctxInfo = contextOf(wm.message), replyWaId = ctxInfo?.stanzaId;
+      known.pending = undefined;
+      known.text = media ? media.caption : real.text;
+      known.kind = real.kind;
+      known.media = media;
+      known.mentions = mentionsOf(wm.message);
+      known.replyWaId = replyWaId;
+      const replied = replyWaId && byWaId.get(waKeyOf(chatJid, replyWaId));
+      if(replied) known.reply_to = replied.id;
+      known.wa = {key: {...key}, message: wm.message};
+      known.edit_date = undefined;
+      return {m: known, dup: true, upgraded: true};
+    }
 
-    const d = describe(wm.message);
+    const d = undecryptable ? {text: '⏳ Waiting for this message. It could not be decrypted yet; WhatsApp is asking the sender to send it again.', kind: 'text'} : describe(wm.message);
     if(!d) return null;
+    if(undecryptable) log(`undecryptable message ${chatJid} ${key.id} (${(wm.messageStubParameters || []).join(' ')}): showing a placeholder until WhatsApp re-sends it`);
 
     const isGroup = kind === 'group';
     let from = SELF;
@@ -654,7 +688,7 @@ module.exports = function createBridge(ctx) {
     const m = addMessage(peerKey, from, media ? media.caption : d.text, tsOf(wm.messageTimestamp), {
       ...(media && {media}),
       reply_to: replied ? replied.id : undefined,
-      replyWaId, jid: chatJid, waId: key.id, kind: d.kind, wstatus: wm.status, mentions: mentionsOf(wm.message),
+      replyWaId, jid: chatJid, waId: key.id, kind: d.kind, wstatus: wm.status, mentions: mentionsOf(wm.message), ...(undecryptable && {pending: true}),
       ...(isGroup && !key.fromMe && mentionsMeOf(wm.message) && {mentionsMe: true}),
       wa: {key: {...key}, message: wm.message}
     });
@@ -729,6 +763,12 @@ module.exports = function createBridge(ctx) {
   function onUpsert({messages, type}) {
     for(const wm of messages) {
       const r = ingest(wm);
+      if(r?.upgraded) {
+        log(`placeholder ${r.m.id} replaced by the real message`);
+        bumpPts();
+        if(ready) push(updatesOf([{_: 'updateEditMessage', message: tlMessage(r.m), pts: getPts(), pts_count: 1}], [r.m]));
+        continue;
+      }
       if(!r || r.dup) { log(`upsert ${type} ${wm.key?.remoteJid} ${wm.key?.fromMe ? 'out' : 'in'}: ${r ? 'duplicate' : 'not a chat message / dropped'}`); continue; }
       // our own sends are announced by the API answer, not by their echo.
       // Live ('notify') messages are announced even while ready=false (store.json was missing/unreadable after a restart):
@@ -988,8 +1028,8 @@ module.exports = function createBridge(ctx) {
   }
 
   function dirty() {
-    clearTimeout(saveT);
-    saveT = setTimeout(save, SAVE_DEBOUNCE_MS);
+    if(saveT) return; // already scheduled: do NOT push it back, or a busy chat would never reach the disk
+    saveT = setTimeout(() => { saveT = null; save(); }, SAVE_DEBOUNCE_MS);
     saveT.unref?.();
   }
 
@@ -1041,7 +1081,38 @@ module.exports = function createBridge(ctx) {
     return sock;
   }
 
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  /** a send issued while WhatsApp is reconnecting waits for it (a few seconds) instead of failing at once */
+  async function awaitActive(ms = SEND_WAIT_MS) {
+    const end = Date.now() + ms;
+    while(!active() && Date.now() < end) await sleep(250);
+    return active();
+  }
+  const TRANSIENT = /closed|timed? ?out|timeout|not connected|econn|socket|stream|disconnect|rate-overlimit|503|428|408|internal-server-error/i;
+  /**
+   * Runs a Baileys send; if the link drops mid-send, waits for the reconnect and sends again with the SAME message id
+   * (WhatsApp de-duplicates by id, so a retry can never deliver the message twice).
+   */
+  async function sendWithRetry(label, run) {
+    let lastErr;
+    for(let n = 1; n <= SEND_ATTEMPTS; n++) {
+      if(!await awaitActive()) throw fail(500, 'WA_NOT_CONNECTED', 'WhatsApp is not connected');
+      const s = sock;
+      let t;
+      try {
+        return await Promise.race([run(s), new Promise((_, rej) => { t = setTimeout(() => rej(new Error('send timed out')), 60000); })]);
+      } catch(e) {
+        lastErr = e;
+        if(n >= SEND_ATTEMPTS || !TRANSIENT.test(String(e?.message || e))) break;
+        log(`${label} attempt ${n} failed (${e.message}), retrying`);
+        await sleep(1000 * n);
+      } finally { clearTimeout(t); }
+    }
+    throw lastErr;
+  }
+
   async function send(peerKey, p) {
+    if(!active()) await awaitActive();
     const s = requireSock();
     const jid = jidOfKey(peerKey);
     if(!jid) throw fail(400, 'PEER_ID_INVALID');
@@ -1055,7 +1126,7 @@ module.exports = function createBridge(ctx) {
     const w = toWaText(p.message, p.entities);
     pendingIds.add(id);
     try {
-      const sent = await s.sendMessage(jid, {text: w.text, ...(w.mentions.length && {mentions: w.mentions})}, {...opts, messageId: id});
+      const sent = await sendWithRetry('send', (cur) => cur.sendMessage(jid, {text: w.text, ...(w.mentions.length && {mentions: w.mentions})}, {...opts, messageId: id}));
       const r = ingest(sent || {key: {remoteJid: jid, fromMe: true, id}, status: 2, messageTimestamp: now(),
         message: w.mentions.length ? {extendedTextMessage: {text: w.text, contextInfo: {mentionedJid: w.mentions}}} : {conversation: w.text}});
       if(!r) throw fail(500, 'WA_SEND_FAILED');
@@ -1073,6 +1144,7 @@ module.exports = function createBridge(ctx) {
 
   /** upload from tweb (inputMediaUploadedPhoto / inputMediaUploadedDocument) -> WhatsApp message */
   async function sendMedia(peerKey, p, buf) {
+    if(!active()) await awaitActive();
     const s = requireSock();
     const jid = jidOfKey(peerKey);
     if(!jid) throw fail(400, 'PEER_ID_INVALID');
@@ -1095,7 +1167,7 @@ module.exports = function createBridge(ctx) {
     const id = B.generateMessageIDV2 ? B.generateMessageIDV2(s.user?.id) : B.generateMessageID();
     pendingIds.add(id);
     try {
-      const sent = await s.sendMessage(jid, content, {...opts, messageId: id});
+      const sent = await sendWithRetry('sendMedia', (cur) => cur.sendMessage(jid, content, {...opts, messageId: id}));
       const r = sent && ingest(sent);
       if(!r) throw fail(500, 'WA_SEND_FAILED');
       if(!r.dup) setPts(getPts() - 1); // own send: delivered by the API answer, must not open a pts hole for the next push
