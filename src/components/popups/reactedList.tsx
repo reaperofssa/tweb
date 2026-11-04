@@ -60,13 +60,17 @@ export async function processDialogElementForReaction({
     if(reaction._ === 'reactionEmoji') {
       const availableReaction = await managers.appReactionsManager.getReaction(reaction.emoticon);
 
-      wrapSticker({
-        doc: availableReaction.static_icon,
-        div: stickerContainer,
-        width: 24,
-        height: 24,
-        middleware
-      });
+      if(availableReaction?.static_icon) {
+        wrapSticker({
+          doc: availableReaction.static_icon,
+          div: stickerContainer,
+          width: 24,
+          height: 24,
+          middleware
+        });
+      } else {
+        stickerContainer.textContent = reaction.emoticon;
+      }
     } else if(reaction._ === 'reactionCustomEmoji') {
       stickerContainer.append(wrapCustomEmoji({
         docIds: [reaction.document_id],
