@@ -371,7 +371,7 @@ export class ChatReactionsMenu {
     let docId = (reaction as Reaction.reactionCustomEmoji).document_id;
     if(!docId) {
       const availableReaction = this.availableReactions.find((_reaction) => _reaction.reaction === (reaction as Reaction.reactionEmoji).emoticon);
-      docId = availableReaction.select_animation.id;
+      docId = availableReaction?.select_animation?.id;
     }
 
     return docId;
@@ -640,7 +640,12 @@ export class ChatReactionsMenu {
     const isPaidReaction = reaction._ === 'reactionPaid';
 
     this.container.append(reactionDiv);
-    if(isPaidReaction && !canUseAnimations) {
+    // * no Telegram sticker assets for this emoji (WhatsApp backend): draw it as plain text
+    if(reaction._ === 'reactionEmoji' && !availableReaction) {
+      appearWrapper.classList.add(REACTION_CLASS_NAME + '-plain-emoji');
+      appearWrapper.textContent = reaction.emoticon;
+      appearWrapper.style.cssText = `width:${size}px;height:${size}px;font-size:${Math.round(size * 0.78)}px;line-height:${size}px;text-align:center;`;
+    } else if(isPaidReaction && !canUseAnimations) {
       appearWrapper.append(StarsStar() as HTMLElement);
     } else if(isPaidReaction && canUseAnimations) {
       const promise = lottieLoader.loadAnimationAsAsset({
