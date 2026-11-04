@@ -53,6 +53,7 @@ const DESTROY_NETWORKERS = true;
 // * SIMULATED BACKEND: when VITE_FAKE_API is set (e.g. http://localhost:3000) every request goes to that
 // * server as plain JSON instead of MTProto, and updates arrive over its /updates WebSocket
 const FAKE_API_URL: string = (import.meta as any).env?.VITE_FAKE_API || '';
+const FAKE_DEAD_MS = 65000; // no tick / update for this long => the updates socket is dead
 const FAKE_JSON = {
   replacer(_key: string, value: any) {
     if(value instanceof Uint8Array) return {__b64: bytesToB64(value)};
@@ -722,37 +723,117 @@ export class ApiManager extends ApiManagerMethods {
     });
   }
 
+  // * Reliability of the simulated transport:
+  // *  - the server sends a {_: 'wsTick'} every ~20 s; if nothing (tick or update) arrives for FAKE_DEAD_MS the socket is
+  // *    half-dead (sleeping phone, proxy dropped it silently) and is recycled instead of waiting for a close event that never comes
+  // *  - every time the socket (re)opens after a gap, tweb is told to run updates.getDifference, which replays what the
+  // *    server journaled meanwhile (new messages, edits, deletes, read marks)
+  // *  - tab becomes visible / network comes back => reconnect now instead of waiting out the backoff, and catch up
+  private fakeEverOpened = false;
+  private fakeLastSeen = 0;
+  private fakeWatchdog: number;
+  private fakeHooksInstalled = false;
+  private fakeHiddenAt = 0;
+
+  private fakeCatchUp() {
+    try { this.networkerFactory.updatesProcessor?.({_: 'updatesTooLong'}); } catch(err) { this.log.error('fake catch-up error', err); }
+  }
+
+  private installFakeHooks() {
+    if(this.fakeHooksInstalled || typeof(window) === 'undefined') return;
+    this.fakeHooksInstalled = true;
+    const wake = () => {
+      const s = this.fakeSocket;
+      if(!s || s.readyState === WebSocket.CLOSED || s.readyState === WebSocket.CLOSING) {
+        this.fakeSocket = undefined;
+        this.fakeSocketAttempt = 0;
+        this.connectFakeUpdates();
+      } else if(s.readyState === WebSocket.OPEN) {
+        // looks open, but may have died while the tab slept: ask the server for anything we missed
+        this.fakeCatchUp();
+      }
+    };
+    document.addEventListener('visibilitychange', () => {
+      if(document.visibilityState === 'hidden') this.fakeHiddenAt = Date.now();
+      else if(Date.now() - this.fakeHiddenAt > 5000) wake();
+    });
+    window.addEventListener('online', wake);
+    window.addEventListener('focus', () => { if(Date.now() - this.fakeLastSeen > 30000) wake(); });
+  }
+
   private connectFakeUpdates() {
     if(this.fakeSocket || !FAKE_API_URL) return;
+    this.installFakeHooks();
     const url = FAKE_API_URL.replace(/^http/, 'ws') + '/updates';
     const socket = this.fakeSocket = new WebSocket(url);
+    let pingTimer: number;
+    this.setFakeStatus(1); // ConnectionStatus.Connecting
     socket.onopen = () => {
       this.fakeSocketAttempt = 0;
+      this.fakeLastSeen = Date.now();
       this.setFakeStatus(0); // ConnectionStatus.Connected
+      // our own heartbeat keeps proxies from idling the socket out and lets the server see we are alive
+      pingTimer = window.setInterval(() => { try { socket.send('ping'); } catch(_) { /* onclose handles it */ } }, 20000);
+      if(!this.fakeWatchdog) {
+        this.fakeWatchdog = window.setInterval(() => {
+          const s = this.fakeSocket;
+          if(s && s.readyState === WebSocket.OPEN && Date.now() - this.fakeLastSeen > FAKE_DEAD_MS) {
+            this.log.warn('fake updates socket is silent, recycling it');
+            try { s.close(); } catch(_) { /* ignore */ }
+            // close() on a dead socket can take minutes to fire onclose: do not wait for it
+            if(this.fakeSocket === s) { this.fakeSocket = undefined; this.connectFakeUpdates(); }
+          }
+        }, 10000);
+      }
+      // reopened after a gap (or the very first open, when requests may already have raced ahead): catch up
+      if(this.fakeEverOpened) this.fakeCatchUp();
+      this.fakeEverOpened = true;
     };
     socket.onmessage = (event) => {
+      this.fakeLastSeen = Date.now();
       try {
         const update = JSON.parse(event.data as string, FAKE_JSON.reviver);
+        if(update?._ === 'wsTick') return;
         this.networkerFactory.updatesProcessor?.(update);
       } catch(err) {
         this.log.error('fake update error', err);
       }
     };
+    socket.onerror = () => { /* onclose follows */ };
     socket.onclose = () => {
-      this.fakeSocket = undefined;
+      clearInterval(pingTimer);
+      if(this.fakeSocket === socket) this.fakeSocket = undefined; // a recycled socket must not wipe its replacement
+      else return;
       this.setFakeStatus(2); // ConnectionStatus.Closed
-      setTimeout(() => this.connectFakeUpdates(), Math.min(10000, 500 * ++this.fakeSocketAttempt));
+      const jitter = Math.random() * 300;
+      setTimeout(() => this.connectFakeUpdates(), Math.min(10000, 500 * ++this.fakeSocketAttempt) + jitter);
     };
+  }
+
+  // Network errors and gateway errors (a sleeping Render instance answers 502/503/504 while it boots) are retried with
+  // backoff. Safe for sends: the server replays the first answer for a repeated random_id instead of sending twice.
+  private fakeFetch(body: string): Promise<string> {
+    const RETRIES = 6;
+    const attempt = (n: number): Promise<string> => fetch(FAKE_API_URL + '/api', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body,
+      keepalive: body.length < 60000
+    }).then((response) => {
+      if(response.status === 502 || response.status === 503 || response.status === 504 || response.status === 429) throw new Error('HTTP ' + response.status);
+      return response.text();
+    }).catch((err) => {
+      if(n >= RETRIES) throw err;
+      this.setFakeStatus(1);
+      return new Promise<void>((resolve) => setTimeout(resolve, Math.min(8000, 400 * 2 ** n) + Math.random() * 250)).then(() => attempt(n + 1));
+    });
+    return attempt(0);
   }
 
   private invokeFake(method: string, params: any, options: InvokeApiOptions): CancellablePromise<any> {
     const deferred = deferredPromise<any>();
     this.connectFakeUpdates();
-    fetch(FAKE_API_URL + '/api', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({method, params, account: this.getAccountNumber()}, FAKE_JSON.replacer)
-    }).then((response) => response.text()).then((text) => {
+    this.fakeFetch(JSON.stringify({method, params, account: this.getAccountNumber()}, FAKE_JSON.replacer)).then((text) => {
       const json = JSON.parse(text, FAKE_JSON.reviver);
       this.setFakeStatus(0);
       if(json.error) {
@@ -765,6 +846,7 @@ export class ApiManager extends ApiManagerMethods {
         deferred.resolve(json.result);
       }
     }).catch((err) => {
+      this.setFakeStatus(2);
       deferred.reject(makeError('NETWORK_ERROR' as any, String(err)));
     });
     return deferred;
