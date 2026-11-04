@@ -176,8 +176,18 @@ function tlMedia(m) {
     document: {_: 'document', pFlags: {}, ...base, mime_type: d.type === 'sticker' ? 'image/webp' : (d.mime || (d.type === 'video' ? 'video/mp4' : d.type === 'audio' ? 'audio/ogg' : 'application/octet-stream')), size: d.size || 0, // tweb only treats exactly image/webp + sticker attribute as a sticker
       ...(thumbs.length && {thumbs}), attributes: attrs}};
 }
+/* reactions: WhatsApp has one reaction per user per message, so m.rx = {emoji: [uid, ...]} */
+const REACTIONS = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
+const reactionEmoji = (e) => ({_: 'reactionEmoji', emoticon: e});
+const tlPeerReaction = (m, e, u) => ({_: 'messagePeerReaction', pFlags: flags({my: u === SELF}), peer_id: {_: 'peerUser', user_id: u}, date: (m.rxAt || {})[u] || m.date, reaction: reactionEmoji(e)});
+const reactionRows = (m) => Object.entries(m.rx || {}).flatMap(([e, us]) => us.map((u) => tlPeerReaction(m, e, u))).sort((a, b) => b.date - a.date);
+const tlReactionsOf = (m) => ({_: 'messageReactions', pFlags: {can_see_list: true}, results: Object.entries(m.rx || {}).filter(([, u]) => u.length)
+  .map(([e, u]) => ({_: 'reactionCount', pFlags: {}, ...(u.includes(SELF) && {chosen_order: 0}), reaction: reactionEmoji(e), count: u.length})),
+  recent_reactions: reactionRows(m).slice(0, 50)});
+const tlReactions = (m) => { const r = tlReactionsOf(m); return r.results.length ? {reactions: r} : {}; };
 const tlMessage = (m) => m.action ? tlService(m) : ({_: 'message', pFlags: flags({out: m.out, mentioned: m.mentionsMe && !m.out, media_unread: isUnreadMention(m)}), id: m.id, from_id: {_: 'peerUser', user_id: m.from},
   peer_id: peerOf(m.key), date: m.date, ...msgBody(m), ...(m.media && {media: tlMedia(m)}), ...(m.edit_date && {edit_date: m.edit_date}),
+  ...tlReactions(m),
   ...(m.reply_to && {reply_to: {_: 'messageReplyHeader', pFlags: {}, reply_to_msg_id: m.reply_to}})});
 const tlDialog = (key) => {
   const list = msgsOf(key), top = list[list.length - 1], rs = readState[key] || (readState[key] = {inbox: 0, outbox: 0});
@@ -210,7 +220,7 @@ const sockets = new Set();
 // A client whose websocket was down (sleeping tab, flaky mobile network, server restart) replays them through updates.getDifference.
 const JOURNAL_MAX = +process.env.JOURNAL_MAX || 2000, JOURNAL_TTL_S = +process.env.JOURNAL_TTL_S || 3 * 86400;
 const journal = []; // {pts, date, update, users, chats}
-const JOURNALED = new Set(['updateEditMessage', 'updateDeleteMessages', 'updateReadHistoryInbox', 'updateReadHistoryOutbox']);
+const JOURNALED = new Set(['updateEditMessage', 'updateDeleteMessages', 'updateReadHistoryInbox', 'updateReadHistoryOutbox', 'updateMessageReactions']);
 function journalize(obj) {
   const ups = obj?._ === 'updates' ? obj.updates : obj?._ === 'updateShort' ? [obj.update] : [];
   for(const u of ups || []) {
@@ -238,7 +248,7 @@ function pushIncoming(key, from, text) {
 
 /* ───────────────────────────── method handlers ───────────────────────────── */
 const fail = (code, type, message) => Object.assign(new Error(type), {code, type, message});
-const bridge = createBridge({users, groups, msgs, readState, SELF, push, updatesOf, tlMessage, tlChat, tlUser, addMessage, touch, WA, fail, now, log,
+const bridge = createBridge({tlReactionsOf, users, groups, msgs, readState, SELF, push, updatesOf, tlMessage, tlChat, tlUser, addMessage, touch, WA, fail, now, log,
   getLastId: () => lastId, setLastId: (n) => { lastId = n; }, getPts: () => pts, setPts: (n) => { pts = n; }, bumpPts: () => ++pts});
 renderMentions = bridge.render;
 const H = {};
@@ -405,6 +415,24 @@ H['messages.deleteMessages'] = async(p) => {
   else for(let i = msgs.length - 1; i >= 0; i--) if(ids.has(msgs[i].id)) msgs.splice(i, 1);
   return {_: 'messages.affectedMessages', pts: ++pts, pts_count: p.id.length};
 };
+// -- reactions (one per user per message on WhatsApp: the first emoji of the list replaces ours, an empty list removes it)
+H['messages.sendReaction'] = async(p) => {
+  const m = msgs.find((x) => x.id === p.msg_id);
+  if(!m) throw fail(400, 'MESSAGE_ID_INVALID');
+  const emoji = (p.reaction || []).find((r) => r._ === 'reactionEmoji')?.emoticon || '';
+  if(bridge.active() && m.wa) await bridge.react(m, emoji);
+  else bridge.setReaction(m, SELF, emoji);
+  return updatesOf([{_: 'updateMessageReactions', peer: peerOf(m.key), msg_id: m.id, reactions: tlReactionsOf(m)}], [m]);
+};
+H['messages.getMessageReactionsList'] = (p) => {
+  const m = msgs.find((x) => x.id === p.id);
+  if(!m) throw fail(400, 'MESSAGE_ID_INVALID');
+  let rows = reactionRows(m);
+  if(p.reaction?._ === 'reactionEmoji') rows = rows.filter((r) => r.reaction.emoticon === p.reaction.emoticon);
+  const off = +p.offset || 0, lim = p.limit || 50, page = rows.slice(off, off + lim);
+  return {_: 'messages.messageReactionsList', pFlags: {}, count: rows.length, reactions: page, chats: [], users: [...new Set(page.map((r) => r.peer_id.user_id))].map(tlUser),
+    ...(off + lim < rows.length && {next_offset: String(off + lim)})};
+};
 H['messages.readHistory'] = (p) => {
   const key = peerKeyOf(p.peer), rs = readState[key] || (readState[key] = {inbox: 0, outbox: 0});
   if(bridge.active()) bridge.markRead(key, p.max_id);
@@ -518,7 +546,7 @@ H['messages.getStickerSet'] = () => { throw fail(400, 'STICKERSET_INVALID'); };
 H['messages.getStickers'] = H['messages.getEmojiStickers'] = (p) => (p.emoticon !== undefined ?
   {_: 'messages.stickers', hash: 0, stickers: []} : {_: 'messages.allStickers', hash: 0, sets: []});
 H['messages.getAvailableReactions'] = () => ({_: 'messages.availableReactions', hash: 0, reactions: []});
-H['messages.getTopReactions'] = () => ({_: 'messages.reactions', hash: 0, reactions: []});
+H['messages.getTopReactions'] = H['messages.getRecentReactions'] = () => ({_: 'messages.reactions', hash: 0, reactions: REACTIONS.map(reactionEmoji)});
 H['messages.getEmojiKeywordsDifference'] = (p) => ({_: 'emojiKeywordsDifference', lang_code: p.lang_code || 'en', from_version: 0, version: 0, keywords: []});
 H['messages.getPaidReactionPrivacy'] = () => updatesOf([]);
 
@@ -533,6 +561,7 @@ H['messages.getFullChat'] = (p) => {
   const g = groups.get(p.chat_id);
   if(!g) throw fail(400, 'CHAT_ID_INVALID');
   return {_: 'messages.chatFull', full_chat: {_: 'chatFull', pFlags: {}, id: p.chat_id, about: '',
+    available_reactions: {_: 'chatReactionsSome', reactions: REACTIONS.map(reactionEmoji)},
     participants: {_: 'chatParticipants', chat_id: p.chat_id, version: 1,
       participants: g.members.map((u) => ({_: 'chatParticipant', user_id: u, inviter_id: SELF, date: now()}))},
     notify_settings: NS()}, chats: [tlChat(p.chat_id)], users: g.members.map(tlUser)};
