@@ -188,9 +188,20 @@ module.exports = function createBridge(ctx) {
       users.set(id, u);
       wantPic('u' + id);
     }
-    if(name && rank >= u.rank) { u.first_name = String(name); u.last_name = ''; u.rank = rank; } // >= : a changed pushName (same rank) must win
+    if(name && rank >= u.rank) {
+      const was = u.first_name;
+      u.first_name = String(name); u.last_name = ''; u.rank = rank; // >= : a changed pushName (same rank) must win
+      if(was && was !== u.first_name) queueUserPush(id); // number -> name: tell tweb now, not after a reload
+    }
     if(!u.first_name) u.first_name = u.phone ? '+' + u.phone : 'WhatsApp user';
     return id;
+  }
+
+  const userPushQ = new Set();
+  function queueUserPush(id) {
+    if(!ready || userPushQ.has(id)) return;
+    userPushQ.add(id);
+    setTimeout(() => { userPushQ.delete(id); if(users.has(id)) pushUser(id); }, 400).unref?.();
   }
 
   function pushUser(id) {
@@ -201,7 +212,7 @@ module.exports = function createBridge(ctx) {
     jid = norm(jid);
     const id = idOf(jid);
     let g = groups.get(id);
-    if(!g) { g = {title: title || 'WhatsApp group', members: [SELF], jid}; groups.set(id, g); wantPic('c' + id); }
+    if(!g) { g = {title: title || 'WhatsApp group', members: [SELF], jid}; groups.set(id, g); wantPic('c' + id, true); }
     else if(title && g.title !== title) {
       g.title = title;
       if(ready) push({_: 'updates', updates: [{_: 'updateChat', chat_id: id}], users: [], chats: [tlChat(id)], date: now(), seq: 0});
@@ -250,8 +261,9 @@ module.exports = function createBridge(ctx) {
       let jid = p.id;
       if(isLid(jid) && p.phoneNumber) { learn(jid, p.phoneNumber); jid = p.phoneNumber; }
       else if(isPn(jid) && p.lid) learn(p.lid, jid);
-      const uid = ensureUser(jid, p.name || p.notify, NAME_RANK.notify);
+      const uid = ensureUser(jid, p.name || p.notify || p.pushName, NAME_RANK.notify);
       members.add(uid);
+      if(!users.get(uid)?.pic) wantPic('u' + uid);
       if(uid === SELF && p.admin) g.selfAdmin = true;
     }
     g.members = [...members];
@@ -341,9 +353,16 @@ module.exports = function createBridge(ctx) {
     catch(e) {
       if(picGone(e)) url = null;
       else if(isRateLimit(e)) { picBackoffUntil = now() + 1800; log('picture queries rate limited, pausing 30 min'); picQueued.add(key); picQueue.unshift(key); return; }
-      else { log(`picture ${jid} failed:`, e.message); return; } // timeout etc: retried at the next recheck
+      else {
+        log(`picture ${jid} failed:`, e.message);
+        rec.picTry = (rec.picTry || 0) + 1; // timeout etc: retry a few times with growing delay instead of waiting for the next reconnect
+        if(rec.picTry <= 4) setTimeout(() => wantPic(key, key[0] === 'c', true), 30000 * rec.picTry).unref?.();
+        return;
+      }
     }
     const prev = rec.pic?.id || 0;
+    if(key[0] === 'c') log(`group picture ${jid}: ${url ? 'found' : 'none/hidden'}`);
+    rec.picTry = 0;
     if(!url) {
       rec.pic = {id: 0, at: now()};
       if(prev) { dropPicFiles(key); announcePic(key); }
@@ -351,7 +370,12 @@ module.exports = function createBridge(ctx) {
       return;
     }
     let buf;
-    try { buf = await fetchBuf(url); } catch(e) { log(`picture ${jid} download failed:`, e.message); return; }
+    try { buf = await fetchBuf(url); } catch(e) {
+      log(`picture ${jid} download failed:`, e.message);
+      rec.picTry = (rec.picTry || 0) + 1;
+      if(rec.picTry <= 4) setTimeout(() => wantPic(key, key[0] === 'c', true), 30000 * rec.picTry).unref?.();
+      return;
+    }
     const id = picIdOf(key, buf);
     rec.pic = {id, at: now()};
     if(id !== prev || !fs.existsSync(picFile(key, false))) {
@@ -451,7 +475,7 @@ module.exports = function createBridge(ctx) {
       const x = c[k];
       if(!x) continue;
       return {
-        type: MEDIA_KEYS[k], key: k, mime: x.mimetype || '', size: num(x.fileLength), w: x.width || 0, h: x.height || 0, dur: x.seconds || 0,
+        type: MEDIA_KEYS[k], key: k, mime: x.mimetype || (k === 'videoMessage' || k === 'ptvMessage' ? 'video/mp4' : k === 'audioMessage' ? 'audio/ogg' : ''), size: num(x.fileLength), w: x.width || 0, h: x.height || 0, dur: x.seconds || 0,
         ptt: !!x.ptt, anim: !!(x.gifPlayback || x.isAnimated), round: k === 'ptvMessage', name: x.fileName || '', caption: x.caption || '',
         thumb: b64(x.jpegThumbnail), wave: b64(x.waveform),
         raw: {url: x.url, directPath: x.directPath, mediaKey: b64(x.mediaKey), fileSha256: b64(x.fileSha256), fileEncSha256: b64(x.fileEncSha256), fileLength: num(x.fileLength), mimetype: x.mimetype}
@@ -477,6 +501,7 @@ module.exports = function createBridge(ctx) {
         log('media download failed:', m.id, e.message);
         throw fail(500, 'WA_MEDIA_UNAVAILABLE', e.message);
       }
+      if(buf && md.size !== buf.length) { md.size = buf.length; dirty(); } // fileLength can be 0 / wrong; tweb's range streaming trusts doc.size
       try { await fs.promises.mkdir(MEDIA_DIR, {recursive: true}); await fs.promises.writeFile(file, buf); } catch(e) { log('media cache write failed:', e.message); }
       return buf;
     })().finally(() => dlInflight.delete(file));
@@ -607,7 +632,7 @@ module.exports = function createBridge(ctx) {
     if(!key.fromMe) {
       const sender = isGroup ? senderJidOfKey(key) : chatJid;
       if(!sender) return null;
-      from = ensureUser(sender, wm.pushName, NAME_RANK.notify);
+      from = ensureUser(sender, wm.pushName || wm.verifiedBizName, wm.pushName ? NAME_RANK.notify : NAME_RANK.verified);
     }
     let peerKey;
     if(isGroup) {
@@ -1121,7 +1146,19 @@ module.exports = function createBridge(ctx) {
 
   /** the UI opened a chat: ask WhatsApp for that contact's presence */
   function openChat(peerKey) {
-    if(active() && peerKey[0] === 'u' && +peerKey.slice(1) !== SELF) watch(jidOfKey(peerKey));
+    if(!active()) return;
+    if(peerKey[0] === 'u' && +peerKey.slice(1) !== SELF) { watch(jidOfKey(peerKey)); return; }
+    if(peerKey[0] !== 'c') return;
+    const g = groups.get(+peerKey.slice(1));
+    if(!g) return;
+    if(!g.pic?.id) wantPic(peerKey, true, true);
+    let n = 0;
+    for(const uid of g.members) {
+      const u = users.get(uid);
+      if(uid !== SELF && u && n < 40 && (!u.pic || (!u.pic.id && now() - u.pic.at > 3600))) { n++; wantPic('u' + uid, true); }
+    }
+    const jid = g.jid || jidOfKey(peerKey);
+    if(jid && !metaCache.has(jid)) fetchMeta(jid);
   }
 
   return {attach, onOpen, whenReady, isReady: () => ready, active, send, edit, del, markRead, setTyping, setOnline, openChat, render, groupMeta, download, sendMedia, pic, markDirty: dirty,
