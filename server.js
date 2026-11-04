@@ -168,7 +168,7 @@ function tlMedia(m) {
   } else if(d.type === 'audio') attrs.push({_: 'documentAttributeAudio', pFlags: flags({voice: d.ptt}), duration: d.dur || 0, ...(d.wave && {waveform: b64of(d.wave)})});
   if(d.type === 'document' || d.name) attrs.push({_: 'documentAttributeFilename', file_name: d.name || 'file'});
   return {_: 'messageMediaDocument', pFlags: flags({video: d.type === 'video' && !d.anim, round: d.round, voice: d.ptt}),
-    document: {_: 'document', pFlags: {}, ...base, mime_type: d.mime || 'application/octet-stream', size: d.size || 0,
+    document: {_: 'document', pFlags: {}, ...base, mime_type: d.type === 'sticker' ? 'image/webp' : (d.mime || 'application/octet-stream'), size: d.size || 0, // tweb only treats exactly image/webp + sticker attribute as a sticker
       ...(thumbs.length && {thumbs}), attributes: attrs}};
 }
 const tlMessage = (m) => m.action ? tlService(m) : ({_: 'message', pFlags: flags({out: m.out, mentioned: m.mentionsMe && !m.out, media_unread: isUnreadMention(m)}), id: m.id, from_id: {_: 'peerUser', user_id: m.from},
