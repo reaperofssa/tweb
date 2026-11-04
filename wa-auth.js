@@ -26,6 +26,10 @@ const SESSIONS_DIR = process.env.WA_SESSIONS_DIR || path.join(__dirname, 'wa-ses
 const PAIR_TTL_MS = +process.env.WA_PAIR_TTL_MS || 120000; // how long we show a code before giving up on it
 const READY_TIMEOUT_MS = 15000;
 const LINKED_TIMEOUT_MS = 20000;
+const RECONNECT_MIN_MS = +process.env.WA_RECONNECT_MIN_MS || 2000; // reconnect backoff: 2 s, 4 s, ... capped, forever (a linked session must never stay down)
+const RECONNECT_MAX_MS = +process.env.WA_RECONNECT_MAX_MS || 60000;
+const WATCHDOG_MS = +process.env.WA_WATCHDOG_MS || 30000; // how often a linked socket is checked for being really alive
+const STALE_MS = +process.env.WA_STALE_MS || 150000; // an 'open' socket that produced no event at all for this long gets probed / recycled
 
 /** STATUS: connecting -> pending (code shown) -> open | expired | failed */
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), '[WA]', ...a);
@@ -56,13 +60,45 @@ function isRegisteredOnDisk(dir) {
   try { return !!JSON.parse(fs.readFileSync(credsFile(dir), 'utf8')).registered; } catch(_) { return false; }
 }
 const isRegistered = (entry) => !!entry.sock?.authState?.creds?.registered;
+const isLinked = (entry) => entry.status === 'open' || isRegistered(entry) || isRegisteredOnDisk(entry.dir); // a session that was linked once must be kept alive
 
 function wipe(dir) {
   try { fs.rmSync(dir, {recursive: true, force: true}); } catch(_) { /* ignore */ }
 }
 
 /** Opens (or reopens) the socket of an entry on its session dir. */
+// Baileys asks for a counter cache to track how often a message was re-requested after a decrypt failure; without it every
+// retry request restarts from 0 and undecryptable messages (the usual "missing message") are retried forever or never.
+const retryCache = (() => {
+  const m = new Map();
+  return {
+    get: (k) => m.get(k),
+    set: (k, v) => { m.set(k, v); if(m.size > 5000) m.delete(m.keys().next().value); },
+    del: (k) => { m.delete(k); },
+    flushAll: () => m.clear()
+  };
+})();
+
+/** Ends and forgets a socket completely, so two sockets of one account never run side by side (WhatsApp would answer connectionReplaced). */
+function killSocket(sock) {
+  if(!sock) return;
+  try { sock.ev.removeAllListeners('connection.update'); } catch(_) { /* ignore */ }
+  try { sock.ev.removeAllListeners('creds.update'); } catch(_) { /* ignore */ }
+  try { sock.end(undefined); } catch(_) { /* ignore */ }
+}
+
 async function connect(entry) {
+  if(entry.closed) return null;
+  if(entry.connecting) return entry.connecting; // never two connects in parallel for one entry
+  entry.connecting = connectNow(entry).finally(() => { entry.connecting = null; });
+  return entry.connecting;
+}
+
+async function connectNow(entry) {
+  clearTimeout(entry.retryTimer);
+  const old = entry.sock;
+  entry.sock = null;
+  killSocket(old);
   const b = await baileys();
   const makeWASocket = b.default || b.makeWASocket;
   const pino = require('pino');
@@ -77,11 +113,20 @@ async function connect(entry) {
     browser: b.Browsers.ubuntu('Chrome'), // same as sano; pairing codes need a desktop-browser identity
     markOnlineOnConnect: false, // a chat client should not silence the phone's notifications
     syncFullHistory: process.env.WA_FULL_HISTORY === '1',
+    keepAliveIntervalMs: +process.env.WA_KEEPALIVE_MS || 20000, // detect a dead link in ~20 s instead of the 30 s default
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
+    retryRequestDelayMs: 250,
+    maxMsgRetryCount: 5,
+    msgRetryCounterCache: retryCache,
     getMessage: (key) => Promise.resolve(hooks.getMessage(key)).catch(() => undefined),
     cachedGroupMetadata: (jid) => Promise.resolve(hooks.cachedGroupMetadata(jid)).catch(() => undefined) // no groupMetadata call per group message
   });
   entry.sock = sock;
   entry.ready = false;
+  entry.lastEvent = Date.now();
+  sock.ev.on('messages.upsert', () => { entry.lastEvent = Date.now(); });
+  sock.ev.on('presence.update', () => { entry.lastEvent = Date.now(); });
   try { hooks.onSocket(entry, sock, b); } catch(e) { log('onSocket hook:', e.stack || e.message); }
 
   sock.ev.on('creds.update', saveCreds);
@@ -95,8 +140,11 @@ function onUpdate(entry, sock, {connection, lastDisconnect, qr}, b) {
   // the handshake is done once the (unused) QR shows up; requestPairingCode needs that
   if(qr) entry.ready = true;
 
+  entry.lastEvent = Date.now();
   if(connection === 'open') {
     clearTimeout(entry.timer);
+    clearTimeout(entry.retryTimer);
+    entry.attempts = 0; // healthy again: next outage starts the backoff from the beginning
     entry.status = 'open';
     entry.user = {jid: sock.user?.id, name: sock.user?.name, phone: jidToPhone(sock.user?.id) || entry.phone};
     active = entry;
@@ -118,19 +166,70 @@ function onUpdate(entry, sock, {connection, lastDisconnect, qr}, b) {
       if(active === entry) active = null;
       wipe(entry.dir);
       try { hooks.onLogout(entry); } catch(_) { /* ignore */ }
-    } else if(entry.status === 'open' || isRegistered(entry)) {
-      // a linked session dropped: bring it back (sano does the same with a 5 s retry)
+    } else if(isLinked(entry)) {
+      // a linked session dropped: bring it back, forever, with a growing delay.
+      // connectionReplaced (440) means another client took the session over; fighting it in a tight loop gets the number flagged, so wait longer.
       entry.status = 'connecting';
-      setTimeout(() => { if(!entry.closed) connect(entry).catch((e) => fail(entry, e)); }, 3000);
+      scheduleReconnect(entry, reason === D.connectionReplaced ? 30000 : 0);
     } else if(entry.status !== 'expired') {
       entry.status = 'failed'; // dropped before the code was accepted: the code is dead with it
     }
   }
 }
 
+/** retries a linked session's connection until it works: 2 s, 4 s, 8 s ... 60 s (+ jitter). Never gives up while the session is registered. */
+function scheduleReconnect(entry, minDelay = 0) {
+  if(entry.closed) return;
+  clearTimeout(entry.retryTimer);
+  const n = entry.attempts = (entry.attempts || 0) + 1;
+  const delay = Math.max(minDelay, Math.min(RECONNECT_MAX_MS, RECONNECT_MIN_MS * 2 ** (n - 1))) + Math.random() * 500;
+  log(`reconnect #${n} for ${entry.phone} in ${Math.round(delay / 1000)} s`);
+  entry.retryTimer = setTimeout(() => {
+    entry.retryTimer = null;
+    if(entry.closed) return;
+    connect(entry).catch((e) => { log(`reconnect #${n} failed: ${e.message}`); entry.status = 'connecting'; scheduleReconnect(entry); });
+  }, delay);
+  entry.retryTimer.unref?.();
+}
+
+/** a real round trip to WhatsApp (an IQ query with an answer); a socket that only *looks* open fails it */
+function probe(entry) {
+  const sock = entry.sock;
+  let t;
+  const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error('probe timeout')), 15000); });
+  const query = typeof sock?.fetchPrivacySettings === 'function' ? sock.fetchPrivacySettings(true) : sock.sendPresenceUpdate('unavailable');
+  return Promise.race([query, timeout]).finally(() => clearTimeout(t));
+}
+
+/** every WATCHDOG_MS: a linked session whose websocket is gone without a 'close' event (or silent for too long) is reconnected */
+setInterval(() => {
+  for(const entry of entries.values()) {
+    if(entry.closed || entry.connecting || !isLinked(entry)) continue;
+    if(entry.status === 'connecting') { // down, and nothing is going to bring it back
+      if(!entry.retryTimer) scheduleReconnect(entry);
+      continue;
+    }
+    if(entry.status !== 'open' || !entry.sock) continue;
+    let wsDead = false;
+    try { wsDead = entry.sock.ws?.isClosed === true || entry.sock.ws?.isClosing === true; } catch(_) { /* unknown ws shape: rely on the silence check */ }
+    const recycle = (why) => {
+      if(entry.closed || entry.status !== 'open') return;
+      log(`watchdog: ${entry.phone} ${why}, reconnecting`);
+      entry.status = 'connecting';
+      scheduleReconnect(entry);
+    };
+    if(wsDead) recycle('socket is closed without notice');
+    else if(Date.now() - (entry.lastEvent || 0) > STALE_MS) {
+      entry.lastEvent = Date.now(); // WhatsApp is quiet on a healthy link too: probe before deciding it is dead
+      probe(entry).catch((e) => recycle(`did not answer a probe (${e.message})`));
+    }
+  }
+}, WATCHDOG_MS).unref();
+
 function fail(entry, e) {
   log(`failed: ${entry.phone}: ${e.message}`);
-  entry.status = 'failed';
+  if(!entry.closed && isLinked(entry)) { entry.status = 'connecting'; scheduleReconnect(entry); } // a linked session is never written off
+  else entry.status = 'failed';
 }
 
 /** Ends an entry's socket. `wipeCreds` removes the session dir, but only for a number that never got linked. */
@@ -238,7 +337,7 @@ async function restore() {
     const entry = {hash: 'restored-' + name, phone: digits(name), dir, status: 'connecting'};
     entries.set(entry.hash, entry);
     log(`restoring session ${name}`);
-    await connect(entry);
+    try { await connect(entry); } catch(e) { log(`restore connect failed: ${e.message}, will keep retrying`); scheduleReconnect(entry); }
     return entry;
   }
   return null;
