@@ -30,6 +30,11 @@
     justify-content: center;
     pointer-events: none;
     overflow: hidden;
+
+    &.is-plain-emoji {
+      font-size: calc(var(--reaction-size) * .8);
+      line-height: 1;
+    }
     
     &-activate {
       position: absolute;
