@@ -167,12 +167,12 @@ function tlMedia(m) {
   const attrs = [];
   if(d.type === 'sticker') attrs.push({_: 'documentAttributeImageSize', w: d.w || 512, h: d.h || 512}, {_: 'documentAttributeSticker', pFlags: {}, alt: '', stickerset: {_: 'inputStickerSetEmpty'}});
   else if(d.type === 'video') {
-    attrs.push({_: 'documentAttributeVideo', pFlags: flags({round_message: d.round}), duration: d.dur || 0, w: d.w || 640, h: d.h || 480});
+    attrs.push({_: 'documentAttributeVideo', pFlags: flags({round_message: d.round, supports_streaming: true}), duration: d.dur || 0, w: d.w || 640, h: d.h || 480});
     if(d.anim) attrs.push({_: 'documentAttributeAnimated'});
   } else if(d.type === 'audio') attrs.push({_: 'documentAttributeAudio', pFlags: flags({voice: d.ptt}), duration: d.dur || 0, ...(d.wave && {waveform: b64of(d.wave)})});
   if(d.type === 'document' || d.name) attrs.push({_: 'documentAttributeFilename', file_name: d.name || 'file'});
   return {_: 'messageMediaDocument', pFlags: flags({video: d.type === 'video' && !d.anim, round: d.round, voice: d.ptt}),
-    document: {_: 'document', pFlags: {}, ...base, mime_type: d.type === 'sticker' ? 'image/webp' : (d.mime || 'application/octet-stream'), size: d.size || 0, // tweb only treats exactly image/webp + sticker attribute as a sticker
+    document: {_: 'document', pFlags: {}, ...base, mime_type: d.type === 'sticker' ? 'image/webp' : (d.mime || (d.type === 'video' ? 'video/mp4' : d.type === 'audio' ? 'audio/ogg' : 'application/octet-stream')), size: d.size || 0, // tweb only treats exactly image/webp + sticker attribute as a sticker
       ...(thumbs.length && {thumbs}), attributes: attrs}};
 }
 const tlMessage = (m) => m.action ? tlService(m) : ({_: 'message', pFlags: flags({out: m.out, mentioned: m.mentionsMe && !m.out, media_unread: isUnreadMention(m)}), id: m.id, from_id: {_: 'peerUser', user_id: m.from},
@@ -236,7 +236,8 @@ const jb = (key, value) => ({_: 'jsonObjectValue', key, value: {_: 'jsonBool', v
 const jn = (key, value) => ({_: 'jsonObjectValue', key, value: {_: 'jsonNumber', value}});
 H['help.getAppConfig'] = () => ({_: 'help.appConfig', hash: 0, config: {_: 'jsonObject', value: [
   jb('premium_purchase_blocked', false), jb('stargifts_blocked', false), jn('stargifts_convert_period_max', 7776000),
-  jn('stargifts_message_length_max', 255), jn('stargifts_pinned_to_top_limit', 6), jn('stars_gifts_enabled', 1)]}});
+  jn('stargifts_message_length_max', 255), jn('stargifts_pinned_to_top_limit', 6), jn('stars_gifts_enabled', 1),
+  jn('stickers_faved_limit_default', 200), jn('stickers_faved_limit_premium', 200)]}});
 H['langpack.getDifference'] = H['langpack.getLangPack'] = (p) => ({_: 'langPackDifference', lang_code: p.lang_code || 'en', from_version: 0, version: 0, strings: []});
 
 // -- auth: real WhatsApp pairing through Baileys (see wa-auth.js)
@@ -691,6 +692,12 @@ const storageOf = (mime = '') => ({_: mime.startsWith('image/jpeg') ? 'storage.f
   : mime === 'video/mp4' ? 'storage.fileMp4' : mime === 'audio/mpeg' ? 'storage.fileMp3' : mime === 'application/pdf' ? 'storage.filePdf' : 'storage.fileUnknown'});
 H['upload.getFile'] = async(p) => {
   const loc = p.location || {}, id = String(loc.id ?? '');
+  if(loc._ === 'inputDocumentFileLocation' && stkById.has(id)) { // favorite / recent sticker (own copy on disk)
+    const buf = await stkBytes(stkById.get(id));
+    if(!buf) throw fail(400, 'FILE_REFERENCE_INVALID');
+    const off = p.offset || 0, lim = p.limit || buf.length;
+    return {_: 'upload.file', type: {_: 'storage.fileWebp'}, mtime: now(), bytes: new Uint8Array(buf.buffer, buf.byteOffset + off, Math.max(0, Math.min(lim, buf.length - off)))};
+  }
   if(loc._ === 'inputPeerPhotoFileLocation') { // WhatsApp profile picture of a user / group (small = preview, big = full size)
     const key = peerKeyOf(loc.peer), buf = key && await bridge.pic(key, !!loc.pFlags?.big);
     if(!buf) throw fail(400, 'LOCATION_INVALID');
@@ -703,6 +710,7 @@ H['upload.getFile'] = async(p) => {
   if(loc.thumb_size === 'm' && m.media.thumb) { buf = Buffer.from(m.media.thumb, 'base64'); mime = 'image/jpeg'; } else buf = await bridge.download(m);
   if(!buf) throw fail(400, 'FILE_REFERENCE_INVALID');
   const off = p.offset || 0, lim = p.limit || buf.length;
+  if(m.media.type === 'video' || m.media.type === 'audio') log(`getFile ${m.media.type} #${m.id} offset=${off} limit=${lim} total=${buf.length} declared=${m.media.size} mime=${mime}`);
   return {_: 'upload.file', type: storageOf(m.media.type === 'image' ? 'image/jpeg' : mime), mtime: m.date, bytes: new Uint8Array(buf.buffer, buf.byteOffset + off, Math.max(0, Math.min(lim, buf.length - off)))};
 };
 
@@ -727,7 +735,12 @@ H['messages.sendMedia'] = async(p) => {
   const key = peerKeyOf(p.peer);
   if(!key) throw fail(400, 'PEER_ID_INVALID');
   if(!bridge.active()) throw fail(400, 'WA_NOT_CONNECTED');
-  const wm = await bridge.sendMedia(key, p, takeUpload(p.media?.file));
+  let wm;
+  if(p.media?._ === 'inputMediaDocument') {
+    const d = await docBytesOf(p.media.id);
+    if(!d) throw fail(400, 'DOCUMENT_INVALID');
+    wm = await bridge.sendMedia(key, {...p, media: {_: 'inputMediaUploadedDocument', mime_type: d.mime, attributes: d.attributes}}, d.buf);
+  } else wm = await bridge.sendMedia(key, p, takeUpload(p.media?.file));
   return updatesOf([{_: 'updateMessageID', id: wm.id, random_id: p.random_id},
     {_: 'updateNewMessage', message: tlMessage(wm), pts, pts_count: 1}], [wm]);
 };
@@ -757,6 +770,82 @@ H['bots.getPopularAppBots'] = () => ({_: 'bots.popularAppBots', pFlags: {}, user
 H['messages.saveDraft'] = () => true;
 H['messages.getRecentStickers'] = () => ({_: 'messages.recentStickers', hash: '0', packs: [], stickers: [], dates: []});
 H['messages.getAllStickers'] = () => ({_: 'messages.allStickers', hash: '0', sets: []});
+
+/* ───────── sticker library: favorites + recents ─────────
+ * WhatsApp has no server-side "faved stickers" list for linked devices, so tweb's Add to favorites / recent lists live here.
+ * A sticker is copied (once, by sha1) to WA_STICKER_DIR, so it survives the chat message being deleted or the media link expiring.
+ * items: sha -> {id, ids[], w, h, alt, size, date}; faved / recent: [sha] newest first. Document ids handed to tweb are the id of the
+ * message it was first saved from (tweb already knows that id), later copies of the same sticker are aliases of it. */
+const STK_DIR = process.env.WA_STICKER_DIR || path.join(__dirname, 'wa-stickers');
+const STK_FILE = path.join(STK_DIR, 'library.json');
+const STK_PIXEL = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+const STK_FAVED_MAX = 200, STK_RECENT_MAX = 60;
+const stkLib = {items: {}, faved: [], recent: []};
+const stkById = new Map(); // document id (any alias) -> sha
+try { Object.assign(stkLib, JSON.parse(fs.readFileSync(STK_FILE, 'utf8'))); } catch {}
+for(const [sha, it] of Object.entries(stkLib.items)) for(const i of it.ids || [it.id]) stkById.set(String(i), sha);
+const stkSave = () => { try { fs.mkdirSync(STK_DIR, {recursive: true}); fs.writeFileSync(STK_FILE + '.tmp', JSON.stringify(stkLib)); fs.renameSync(STK_FILE + '.tmp', STK_FILE); } catch(e) { log('sticker library save failed:', e.message); } };
+const stkBytes = (sha) => fs.promises.readFile(path.join(STK_DIR, sha + '.webp')).catch(() => null);
+const stkDoc = (it) => ({_: 'document', pFlags: {}, id: String(it.id), access_hash: '1', file_reference: b64of(''), date: it.date || now(), dc_id: 2, mime_type: 'image/webp', size: it.size || 0,
+  thumbs: [{_: 'photoCachedSize', type: 'm', w: 100, h: 100, bytes: b64of(STK_PIXEL)}],
+  attributes: [{_: 'documentAttributeImageSize', w: it.w || 512, h: it.h || 512}, {_: 'documentAttributeSticker', pFlags: {}, alt: it.alt || '', stickerset: {_: 'inputStickerSetEmpty'}}]});
+
+/** library item for a tweb document id: known one, or copy the sticker out of the chat message that has this id */
+async function stkEnsure(docId) {
+  docId = String(docId);
+  if(stkById.has(docId)) return stkLib.items[stkById.get(docId)];
+  const m = msgs.find((x) => x.media?.type === 'sticker' && String(x.id) === docId);
+  if(!m) return null;
+  const buf = await bridge.download(m).catch(() => null);
+  if(!buf) return null;
+  const sha = require('crypto').createHash('sha1').update(buf).digest('hex');
+  let it = stkLib.items[sha];
+  if(!it) {
+    it = stkLib.items[sha] = {id: docId, ids: [], w: m.media.w || 512, h: m.media.h || 512, alt: m.media.alt || '', size: buf.length, date: now()};
+    fs.mkdirSync(STK_DIR, {recursive: true});
+    await fs.promises.writeFile(path.join(STK_DIR, sha + '.webp'), buf);
+  }
+  if(!it.ids.includes(docId)) it.ids.push(docId);
+  stkById.set(docId, sha);
+  return it;
+}
+const stkDocsOf = (list) => list.map((sha) => stkLib.items[sha]).filter(Boolean).map(stkDoc);
+const unshiftUniq = (arr, v, max) => { const i = arr.indexOf(v); if(i >= 0) arr.splice(i, 1); arr.unshift(v); arr.length = Math.min(arr.length, max); };
+
+H['messages.getFavedStickers'] = () => ({_: 'messages.favedStickers', hash: '0', packs: [], stickers: stkDocsOf(stkLib.faved)});
+H['messages.faveSticker'] = async(p) => {
+  const it = await stkEnsure(p.id?.id);
+  if(!it) throw fail(400, 'STICKER_ID_INVALID');
+  const sha = stkById.get(String(p.id.id));
+  stkLib.faved = stkLib.faved.filter((x) => x !== sha);
+  if(!p.unfave) unshiftUniq(stkLib.faved, sha, STK_FAVED_MAX);
+  stkSave();
+  return true;
+};
+H['messages.getRecentStickers'] = () => ({_: 'messages.recentStickers', hash: '0', packs: [], stickers: stkDocsOf(stkLib.recent), dates: stkLib.recent.map(() => now())});
+H['messages.saveRecentSticker'] = async(p) => {
+  const it = await stkEnsure(p.id?.id);
+  if(!it) return true; // not a sticker we can keep: ignore quietly (tweb also calls this for gifs)
+  const sha = stkById.get(String(p.id.id));
+  stkLib.recent = stkLib.recent.filter((x) => x !== sha);
+  if(!p.unsave) unshiftUniq(stkLib.recent, sha, STK_RECENT_MAX);
+  stkSave();
+  return true;
+};
+H['messages.clearRecentStickers'] = () => { stkLib.recent = []; stkSave(); return true; };
+
+/** bytes + mime + attributes of a document tweb wants to (re)send: a library sticker, or any media still in a chat */
+async function docBytesOf(input) {
+  const id = String(input?.id ?? '');
+  if(stkById.has(id)) {
+    const buf = await stkBytes(stkById.get(id)), it = stkLib.items[stkById.get(id)];
+    return buf && {buf, mime: 'image/webp', attributes: stkDoc(it).attributes};
+  }
+  const m = msgs.find((x) => x.media && x.media.type !== 'image' && String(x.id) === id);
+  if(!m) return null;
+  const buf = await bridge.download(m).catch(() => null), doc = tlMedia(m)?.document;
+  return buf && doc && {buf, mime: doc.mime_type, attributes: doc.attributes};
+}
 
 /* ───────────────────────────── collectible gifts ("NFTs": starGiftUnique) ─────────────────────────────
  * A regular gift with upgrade_stars can be upgraded into a unique gift: a random model + pattern + backdrop, a number and a slug.
