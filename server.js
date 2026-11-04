@@ -118,6 +118,7 @@ function addMessage(key, from, text, date = now(), extra = {}) {
   const m = {id: ++lastId, key, from, text, date, out: from === SELF, ...extra};
   msgs.push(m);
   pts++;
+  m.pts = pts; // lets updates.getDifference hand back what a client missed
   return m;
 }
 
@@ -307,7 +308,11 @@ H['contacts.getTopPeers'] = () => ({_: 'contacts.topPeersDisabled'});
 
 // -- updates
 H['updates.getState'] = () => state();
-H['updates.getDifference'] = () => ({_: 'updates.difference', new_messages: [], new_encrypted_messages: [], other_updates: [], chats: [], users: [], state: state()});
+H['updates.getDifference'] = (p) => { // a pts hole on the client (answer and push crossed, ws reconnect) must not lose messages
+  const since = p.pts || 0, min = now() - 6 * 3600;
+  const fresh = msgs.filter((m) => m.pts > since && m.date >= min).slice(-300);
+  return {_: 'updates.difference', new_messages: fresh.map(tlMessage), new_encrypted_messages: [], other_updates: [], ...entities(fresh), state: state()};
+};
 
 // -- dialogs / history
 H['messages.getDialogs'] = (p) => {
@@ -345,7 +350,7 @@ H['messages.sendMessage'] = async(p) => {
   if(bridge.active()) {
     const wm = await bridge.send(key, p);
     return updatesOf([{_: 'updateMessageID', id: wm.id, random_id: p.random_id},
-      {_: 'updateNewMessage', message: tlMessage(wm), pts, pts_count: 1}], [wm]);
+      {_: 'updateNewMessage', message: tlMessage(wm), pts: 0, pts_count: 0}], [wm]);
   }
   const reply = p.reply_to?.reply_to_msg_id;
   const m = addMessage(key, SELF, p.message, now(), {reply_to: reply});
@@ -742,7 +747,7 @@ H['messages.sendMedia'] = async(p) => {
     wm = await bridge.sendMedia(key, {...p, media: {_: 'inputMediaUploadedDocument', mime_type: d.mime, attributes: d.attributes}}, d.buf);
   } else wm = await bridge.sendMedia(key, p, takeUpload(p.media?.file));
   return updatesOf([{_: 'updateMessageID', id: wm.id, random_id: p.random_id},
-    {_: 'updateNewMessage', message: tlMessage(wm), pts, pts_count: 1}], [wm]);
+    {_: 'updateNewMessage', message: tlMessage(wm), pts: 0, pts_count: 0}], [wm]);
 };
 
 /* ── emoji statuses (premium) ── */
