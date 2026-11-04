@@ -127,6 +127,7 @@ const tlUser = (id) => {
   const u = users.get(id) || {first_name: 'User ' + id, last_name: '', phone: String(id)};
   return {_: 'user', pFlags: flags({self: id === SELF, contact: id !== SELF && u.contact !== false, mutual_contact: id !== SELF && u.contact !== false, premium: id === SELF ? acct.premium : !!u.premium}), id, access_hash: '1',
     first_name: u.first_name, last_name: u.last_name || '', ...(u.username && {username: u.username}), ...(u.emoji_status && {emoji_status: u.emoji_status}), phone: u.phone,
+    ...(u.pic?.id && {photo: {_: 'userProfilePhoto', pFlags: {}, photo_id: String(u.pic.id), dc_id: 2}}),
     status: u.status || {_: 'userStatusRecently', pFlags: {}}};
 };
 // tweb's hasRights() answers false for a chat with no default_banned_rights/admin_rights => "Sending messages is not allowed in this group".
@@ -135,7 +136,7 @@ const SEND_BANS = ['send_messages', 'send_plain', 'send_media', 'send_photos', '
   'send_voices', 'send_docs', 'send_stickers', 'send_gifs', 'send_games', 'send_inline', 'embed_links', 'send_polls'];
 const tlChat = (id) => {
   const g = groups.get(id), muted = !!(g.announce && !g.selfAdmin);
-  return {_: 'chat', pFlags: {}, id, title: g.title, photo: {_: 'chatPhotoEmpty'}, participants_count: g.members.length, date: now(), version: 1,
+  return {_: 'chat', pFlags: {}, id, title: g.title, photo: g.pic?.id ? {_: 'chatPhoto', pFlags: {}, photo_id: String(g.pic.id), dc_id: 2} : {_: 'chatPhotoEmpty'}, participants_count: g.members.length, date: now(), version: 1,
     default_banned_rights: {_: 'chatBannedRights', pFlags: muted ? Object.fromEntries(SEND_BANS.map((k) => [k, true])) : {}, until_date: 0}};
 };
 const tlService = (m) => ({_: 'messageService', pFlags: flags({out: m.out}), id: m.id, from_id: {_: 'peerUser', user_id: m.from},
@@ -690,6 +691,12 @@ const storageOf = (mime = '') => ({_: mime.startsWith('image/jpeg') ? 'storage.f
   : mime === 'video/mp4' ? 'storage.fileMp4' : mime === 'audio/mpeg' ? 'storage.fileMp3' : mime === 'application/pdf' ? 'storage.filePdf' : 'storage.fileUnknown'});
 H['upload.getFile'] = async(p) => {
   const loc = p.location || {}, id = String(loc.id ?? '');
+  if(loc._ === 'inputPeerPhotoFileLocation') { // WhatsApp profile picture of a user / group (small = preview, big = full size)
+    const key = peerKeyOf(loc.peer), buf = key && await bridge.pic(key, !!loc.pFlags?.big);
+    if(!buf) throw fail(400, 'LOCATION_INVALID');
+    const off = p.offset || 0, lim = p.limit || buf.length;
+    return {_: 'upload.file', type: {_: 'storage.fileJpeg'}, mtime: now(), bytes: new Uint8Array(buf.buffer, buf.byteOffset + off, Math.max(0, Math.min(lim, buf.length - off)))};
+  }
   const m = loc._ && /^input(Photo|Document)FileLocation$/.test(loc._) && !stickerBytes.has(id) ? msgs.find((x) => x.media && String(x.id) === id) : null;
   if(!m) return prevGetFile(p);
   let buf, mime = m.media.mime;
